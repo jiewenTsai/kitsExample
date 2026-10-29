@@ -1,0 +1,497 @@
+---
+title: "kitsPreview 導覽：dexter、immer、cNORM 的原貌"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    from: markdown+east_asian_line_breaks
+    embed-resources: true
+    grid:
+      body-width: 1100px
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", out.width = "100%")
+options(width = 100)
+```
+
+這份導覽讓你看 kitsPreview 印出來的樣子。
+文字很少；重點是每一步的輸出、表和圖。
+
+**資料是模擬資料。**
+示範資料來自 kits 套件，沒有任何一列是真實的孩子。
+請不要把這裡的數字當作 KIT 的結果引用。
+
+
+## 0 kitsPreview 是什麼
+
+**問題：kitsPreview 和 kits 有什麼不同？**
+
+kitsPreview 是教學用的薄包裝：每一步只跑幾行別的套件的程式。
+校準用 dexter 或 immer，計分用 dexter，常模用 cNORM，連結用 base R。
+`kits_item()` 的 `engine =` 選擇用哪個套件校準。
+套件自己的結果原封不動留著，讓你看到每一步直接用那個套件會得到什麼。
+主套件 kits 用 RTMB 從頭寫；兩個套件的函數同名，數字相同（第 8 節）。
+
+```{r load, message = FALSE}
+library(kitsPreview)
+library(dplyr)
+library(purrr)
+```
+
+
+## 1 資料
+
+**問題：kitsPreview 要什麼樣的作答資料？**
+
+示範資料放在 kits 裡。
+這裡只從 kits 取資料，不用 `library(kits)`。
+
+```{r data}
+data("kitm03", "kitm36", package = "kits")
+kitm03$responses |>
+  head(3)
+```
+
+kitsPreview 沒有 `kits_resp()`。
+它直接收 dexter 的格式：作答矩陣，或有 `visit_id`、`item_id`、`item_score` 的長表。
+留下兩個世代的語言。
+
+```{r lan03}
+lan03 <- kitm03$responses |>
+  filter(domain == "lan")
+lan36 <- kitm36$responses |>
+  filter(domain == "lan")
+```
+
+孩子的資料另外放一張表，一個人次一列。
+計分時用 `persons =` 接上。
+
+```{r persons}
+persons <- rbind(kitm03$responses, kitm36$responses) |>
+  distinct(visit_id, subj_id, cohort, sex, wave_m, age_m)
+persons |>
+  count(cohort)
+```
+
+
+## 2 校準
+
+**問題：每一題的每個步驟落在量尺的哪裡？**
+
+預設的引擎是 dexter（`fit_enorm()`，條件最大概似）。
+
+```{r item}
+item <- kits_item(lan03)
+item
+```
+
+印出來的第一行說明引擎、人次、題數、步驟數和作答組合數。
+最後一行是題目適配的摘要（第 3 節）。
+全部的步驟用 `coef()` 取。
+
+```{r item-coef}
+coef(item) |>
+  filter(item_score == 1) |>
+  head(4)
+```
+
+### Wright 圖
+
+kitsPreview 的 Wright 圖畫在 `kits()` 的結果上：`kits()` 一次做完校準和計分。
+這是互動圖；滑鼠停在點上可以看題號。
+
+```{r wright, fig.height = 5}
+fit <- kits(lan03)
+plot(fit)
+```
+
+### dexter 自己的輸出
+
+`summary()` 先印整理過的表，再印 dexter 自己的輸出。
+
+```{r item-summary}
+summary(item)
+```
+
+dexter 的物件用 `kits_original()` 取，再用 dexter 自己的函數讀。
+
+```{r item-original}
+enorm <- kits_original(item)
+class(enorm)
+coef(enorm) |>
+  head(3)
+```
+
+dexter 的表叫 `SE_beta`；kitsPreview 把它改成 `beta_se`。
+
+### 換一個引擎：immer
+
+同一個模型，改用 immer 的 `immer_cml()` 估計。
+
+```{r item-immer}
+item_immer <- kits_item(lan03, engine = "immer")
+item_immer
+```
+
+immer 自己的物件也留著。
+immer 的參數是累加的，名稱是「題號_Cat 類別」。
+
+```{r immer-original}
+kits_original(item_immer)$b |>
+  head(4)
+```
+
+immer 的原點和 dexter 不同；kitsPreview 減掉一個常數，放到 dexter 的原點。
+這裡減掉的是 `r round(item_immer$shift, 3)`。
+兩個引擎的差距：
+
+```{r engines-agree}
+c("beta", "beta_se", "thr", "thr_se") |>
+  map(\(v) tibble(
+    column = v,
+    max_abs_diff = max(abs(coef(item_immer)[[v]] - coef(item)[[v]]))
+  )) |>
+  list_rbind()
+```
+
+```{r engines-se, include = FALSE}
+ratio <- abs(coef(item_immer)$beta - coef(item)$beta) / coef(item)$beta_se
+```
+
+兩者是同一個條件概似，差別只在最佳化停下來的地方。
+最大的差距不到該步驟 SE 的 `r ceiling(max(ratio) * 100) / 100` 倍。
+
+
+## 3 題目適配
+
+**問題：每一題的作答符合模型嗎？**
+
+`kits_item()` 已經在同一份資料上算好題目適配，存在 `item$itemfit`。
+依 infit 由大到小排。
+
+```{r itemfit}
+item$itemfit |>
+  arrange(desc(infit)) |>
+  head(5)
+```
+
+圖上每題兩個點；灰色帶是印出結果時用的範圍。
+
+```{r itemfit-plot, fig.height = 4}
+plot(item, type = "fit")
+```
+
+```{r itemfit-outside, include = FALSE}
+outside <- item$itemfit |>
+  filter(infit < 0.6 | infit > 1.4 | outfit < 0.6 | outfit > 1.4)
+```
+
+範圍外的題有 `r nrow(outside)` 題：`r paste(outside$item_id, collapse = "、")`。
+`kits_itemfit(data, item)` 給同一張表；它用來拿同一批題目檢查別的資料。
+
+```{r itemfit-same}
+identical(kits_itemfit(lan03, item), item$itemfit)
+```
+
+dexter 自己也有題目的圖：每組能力的平均得分（點）和模型的預測（灰線）。
+它畫在 dexter 的物件上，資料要用 dexter 的長表，人次的欄叫 dexter 的名字 `person_id`。
+左邊是範圍外的 `r outside$item_id[1]`，右邊是一題適配好的題目。
+
+```{r dexter-plot, fig.height = 4}
+dexter_long <- lan03 |>
+  select(person_id = visit_id, item_id, item_score)
+par(mfrow = c(1, 2))
+plot(kits_original(item), item_id = c(outside$item_id[1], "lana02"), dataSrc = dexter_long)
+```
+
+
+## 4 計分
+
+**問題：每個人次在量尺的哪裡？**
+
+計分一律用 dexter 的 `ability()`（WLE）。
+`persons =` 把孩子的資料接在後面。
+
+```{r subj}
+scores <- kits_subj(lan03, item, persons = persons)
+scores |>
+  select(pattern_id, visit_id, raw, raw_max, theta, se, infit, outfit, flag, wave_m) |>
+  head(4)
+```
+
+kitsPreview 的分數表沒有簡短的印法，所以這裡用 `head()`，只留幾欄。
+個人適配在同一張表：`infit`、`outfit` 和 `flag`。
+
+```{r subj-flag}
+scores |>
+  count(flag)
+```
+
+`summary()` 先印摘要，再印 dexter 自己的 `ability()` 表。
+dexter 自己的輸出刻意保留 dexter 的欄名（`person_id`、`booklet_id`、`booklet_score`），其他地方都用 kitsPreview 的名字。
+
+```{r subj-summary}
+summary(scores)
+```
+
+### 原始分對照表
+
+每個波次的標準題本，每個原始分對應一個 θ。
+
+```{r subj-table}
+raw_table <- kits_subj_table(scores)
+raw_table |>
+  filter(wave_m == 12) |>
+  head(5)
+```
+
+`form_pct` 是答標準題本的孩子占這一波的百分比。
+其他作答組合的孩子不在表裡。
+
+
+## 5 連結
+
+**問題：M36 和 M03 的孩子怎麼放上同一把量尺？**
+
+### M36 → M03
+
+M36 自己校準一次，再用共同題的門檻連結。
+
+```{r link}
+item36 <- kits_item(lan36)
+co <- kits_linking(item36, item)
+co
+```
+
+```{r link-info, include = FALSE}
+n_boot <- co$settings$n_boot
+```
+
+一條直線：M03 的 θ = intercept + slope × M36 的 θ。
+括號裡是連結誤差：整題重抽 `r format(n_boot, big.mark = ",")` 次。
+`coef()` 給截距和斜率，順序和 `lm()` 一樣。
+
+```{r link-coef}
+coef(co)
+```
+
+```{r link-plot, fig.height = 4.5}
+plot(co)
+```
+
+kitsPreview 沒有 `kits_convert()`；換尺就是這條直線，SE 乘上斜率。
+
+```{r convert}
+scores36 <- kits_subj(lan36, item36, persons = persons) |>
+  mutate(theta = co$intercept + co$slope * theta, se = co$slope * se)
+both <- rbind(scores, scores36)
+```
+
+`kits_vertical()` 摘要每個世代、每個波次的位置。
+
+```{r vertical}
+v <- kits_vertical(both)
+v
+```
+
+```{r vertical-plot, fig.height = 4.5}
+plot(v, type = "median")
+```
+
+兩個世代都有的波次，兩組點應該很接近。
+
+### 語言和動作接到 D
+
+每個領域各校準一次，再用 `kitm03$anchors` 的錨題一起接到 D。
+
+```{r d-items}
+domains <- c("lan", "motor") |>
+  set_names()
+resp_d <- domains |>
+  map(\(d) filter(kitm03$responses, domain == d))
+items_d <- resp_d |>
+  map(kits_item)
+```
+
+kitsPreview 接到 D 用另一個函數 `kits_linking_d()`。
+
+```{r d-link}
+d_link <- kits_linking_d(items_d, kitm03$anchors)
+d_link
+```
+
+兩個領域共用一條線：D = `r round(d_link$intercept, 1)` + `r round(d_link$slope, 2)` × θ。
+`domains` 表讓每個領域有自己的截距，用來檢查共用一條線是否合理。
+
+```{r d-link-plot, fig.height = 4.5}
+plot(d_link)
+```
+
+兩個領域的分數換成 D，再看每個波次的平均。
+
+```{r d-scores}
+d_scores <- map2(resp_d, items_d, \(r, i) kits_subj(r, i, persons = persons)) |>
+  list_rbind(names_to = "domain") |>
+  mutate(theta = d_link$intercept + d_link$slope * theta)
+d_scores |>
+  summarise(D = round(mean(theta), 1), .by = c(wave_m, domain)) |>
+  tidyr::pivot_wider(names_from = domain, values_from = D)
+```
+
+
+## 6 常模
+
+**問題：一個孩子在同月齡孩子中排在哪裡？**
+
+常模用 cNORM 的 shash 模型。
+先排除拿到最低分的孩子太多的波次。
+
+```{r norm-screen}
+screen <- kits_norm_screen(scores)
+screen
+```
+
+男孩、女孩各配一份常模。
+
+```{r norms}
+normed <- scores[screen$normed, ]
+norms <- kits_norms(normed, by = "sex")
+norms |>
+  filter(age_m %in% c(12, 24, 48)) |>
+  select(sex, age_m, mu, sigma, P3, P50, P97)
+```
+
+```{r norms-plot, fig.height = 5}
+plot(norms, scores = normed)
+```
+
+灰點是一個一個的孩子。
+同齡 z 和百分等級加在分數表後面。
+
+```{r norm-z}
+scores_z <- kits_norm_z(scores, norms)
+scores_z |>
+  filter(!is.na(z)) |>
+  summarise(mean = round(mean(z), 2), sd = round(sd(z), 2), .by = wave_m)
+```
+
+`kits_original()` 在常模上回傳 cNORM 自己的配適結果（`cnorm.shash()`）。
+分組的常模每組一個；裡面只有係數和摘要，沒有孩子的分數。
+
+```{r norms-original}
+orig <- kits_original(norms)
+names(orig)
+orig$boy[c("mu_degree", "sigma_degree", "epsilon_degree", "delta_degree")] |>
+  unlist()
+```
+
+整段 cNORM 程式在 `kits_code()` 裡（第 7 節）。
+
+
+## 7 程式和公式
+
+**問題：每一步背後是哪幾行程式、哪個公式？**
+
+`kits_code()` 寫出可以直接執行的程式，不需要 kitsPreview。
+校準的程式，核心是 dexter 的幾行：
+
+```{r code-item}
+code_item <- kits_code(item)
+code_item |>
+  as.character() |>
+  head(20) |>
+  writeLines()
+```
+
+照組的常模要一組一組寫。
+cNORM 的部分：
+
+```{r code-norms}
+code_norm <- kits_code(attr(norms, "groups")[[1]]) |>
+  as.character()
+start <- grep("^# 2 Fit", code_norm)
+writeLines(code_norm[start + 0:5])
+```
+
+這份程式可以直接執行。
+女孩那一組寫到檔案，再在一個新的環境裡跑；程式要的 `D`、`age_m` 先放進去。
+
+```{r code-run}
+girls <- normed |>
+  filter(sex == "girl")
+code_file <- tempfile(fileext = ".R")
+kits_code(attr(norms, "groups")[[2]], file = code_file)
+run <- list2env(list(D = girls$theta, age_m = girls$age_m))
+sys.source(code_file, envir = run)
+```
+
+跑出來的百分位和 `kits_norms()` 的相同：
+
+```{r code-run-same}
+girl_norm <- norms |>
+  filter(sex == "girl")
+max(abs(run$norm$P50 - girl_norm$P50))
+```
+
+`run$best` 是 cNORM 自己的物件，可以用 cNORM 自己的圖。
+橫軸是月齡的平方根，因為 kitsPreview 用 `age_x = sqrt` 配常模。
+
+```{r cnorm-plot, fig.height = 4.5, message = FALSE}
+class(run$best)
+plot(run$best, age = run$age_x(run$age_use), score = run$D_use)
+```
+
+`kits_equations()` 寫出公式；連結會附上這條線的數字。
+
+```{r equations}
+kits_equations(co)
+```
+
+主題也可以直接給，例如計分：
+
+```{r equations-subj}
+kits_equations("subj")
+```
+
+
+## 8 和 kits 的數字相同
+
+**問題：kitsPreview 和 kits 算出來一樣嗎？**
+
+用 kits 重做校準、計分、連結和題目適配。
+
+```{r kits-run}
+k_resp <- kits::kits_resp(lan03)
+k_item <- kits::kits_item(k_resp, scale = "lan M03")
+k_subj <- kits::kits_subj(k_resp, k_item)
+k_item36 <- kits::kits_item(kits::kits_resp(lan36), scale = "lan M36")
+k_co <- kits::kits_linking(k_item36, k_item)
+```
+
+```{r kits-diff}
+tibble(
+  result = c("thr", "theta", "intercept", "slope", "infit"),
+  max_abs_diff = c(max(abs(coef(k_item)$thr - coef(item)$thr)),
+                   max(abs(k_subj$theta - scores$theta)),
+                   abs(k_co$intercept - co$intercept),
+                   abs(k_co$slope - co$slope),
+                   max(abs(k_item$itemfit$infit - item$itemfit$infit)))
+)
+```
+
+差距都在電腦的捨入誤差以內。
+kits 的連結印出來多一行量尺的名字；kitsPreview 的連結預設多做連結誤差。
+
+```{r kits-link}
+k_co
+```
+
+
+## 9 下一步
+
+* **kits 入門**：`tutorial_beginner/`。同樣的步驟，用主套件 kits 一步一步做。
+* **和 TAM 比較**：`tutorial_compare/`。
+* **三個引擎**：`vignette("engines", package = "kitsPreview")` 比較 dexter、immer 和成對的 CCML。
+* **完整流程**：`vignette("kits-flow", package = "kitsPreview")` 包括偏移、DIF、題目表和成長階梯。

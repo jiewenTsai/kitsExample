@@ -1,0 +1,993 @@
+---
+title: "演算法 3：連結與換算"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    embed-resources: true
+    grid:
+      body-width: 1100px
+from: markdown+east_asian_line_breaks
+---
+
+```{=html}
+<style>
+.MathJax_Display, mjx-container { overflow-x: auto; overflow-y: hidden; }
+</style>
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+options(width = 100)
+library(kits)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+t_start <- Sys.time()
+```
+
+這是六份演算法教學的第三份。
+前兩份做出校準（[01_calibration](01_calibration.html)）和分數（[02_scoring](02_scoring.html)）。
+這一份把兩條量尺接起來，再把分數換到另一條量尺上。
+
+你會學到：
+
+* 連結的「點」是什麼：兩次校準的共同步驟，或錨題。
+* mean/sigma 線怎麼算，為什麼先篩一次點。
+* 連結誤差怎麼從「整題重抽」得到。
+* 分數怎麼換算（`kits_convert()`），換算後的 `se_link`、`se_total` 怎麼來。
+* 為什麼要把斜率和 1 比，以及接到 D 時的 domain check。
+
+你需要：
+
+* R 和 kits `r packageVersion("kits")`，以及 dplyr、tidyr、purrr、tibble、ggplot2。
+* 知道 `kits_item()` 的門檻（`thr`）是什麼（[01_calibration](01_calibration.html)）。
+* 知道 `kits_subj()` 的 $\theta$ 和 SE 是什麼（[02_scoring](02_scoring.html)）。
+
+每一節都照同樣的順序走：這一步要做什麼 → 公式（排好的數學式，下面是可以一鍵複製的 LaTeX）→ 用示範資料手算 → 用 kits 的兩層函數再算一次 → 教學程式在哪一段。
+`kits_` 的步驟會檢查、會記下量尺；`algo_` 的積木只有算法。
+每次都用 `identical()` 對答案；只有浮點運算的順序不同時，才用 `all.equal()`，並寫出容許誤差。
+
+連結本身沒有模型可以寫：它是封閉解（平均、SD、重抽），全部用 base R。
+所以這一份不用 RTMB；模型的部分在 [kits 的模型](../tutorial_models/kits_models.html)。
+
+
+## 0 準備
+
+### 0.1 這個算法有幾步
+
+`kits_algorithm()` 用三十行左右說出一個算法：幾步、每步一條式子、哪些函數做這些步驟、文獻、教學程式。
+被移除的 `kits_equations()`、`kits_code()` 給的東西，現在分成兩半：短的在這裡，詳細的在這份教學。
+
+```{r}
+kits_algorithm("link")
+```
+
+這份教學一步一步走完這六步。
+`Components` 的第二行是 `algo_` 的積木；它們實際接起來的順序是 `algo_screen(from, to, item) |> algo_mean_sigma()`（第 3 節）。
+
+### 0.2 示範資料：三個校準
+
+示範資料是模擬的（`?kitm03`），沒有真實孩子的資料。
+作答是長的表：一列是一個人次答一題（`visit_id`、`item_id`、`item_score`，加上月齡等欄）。
+`kits_item()` 直接吃這種表。
+
+```{r}
+lan03 <- filter(kitm03$responses, domain == "lan")
+motor03 <- filter(kitm03$responses, domain == "motor")
+lan36 <- filter(kitm36$responses, domain == "lan")
+c(lan03 = nrow(lan03), motor03 = nrow(motor03), lan36 = nrow(lan36))
+```
+
+三個校準，各有自己的量尺標籤。
+標籤讓 kits 知道一個分數在哪一條量尺上，換錯了會停下來。
+
+```{r}
+item03 <- kits_item(lan03, scale = "lan M03")
+item_motor <- kits_item(motor03, scale = "motor M03")
+item36 <- kits_item(lan36, scale = "lan M36")
+```
+
+### 0.3 小工具
+
+教學程式是套件裡的 `.R` 檔，每一段用 `# ==== part: 名字 ====` 開頭。
+`show_part()` 只印其中一段：從這一行印到下一個 `# ====` 之前。
+找不到這一段時停下來，所以程式改了段名，這裡會知道。
+
+```{r}
+read_part <- function(file, part) {
+  code <- readLines(system.file("scripts", file, package = "kits"))
+  start <- grep(paste0("# ==== part: ", part, " ===="), code, fixed = TRUE)
+  if (length(start) != 1) stop("no part ", part, " in ", file)
+  heads <- grep("^# ====", code)
+  end <- c(heads[heads > start], length(code) + 1)[1] - 1
+  code[start:end]
+}
+```
+
+```{r}
+show_part <- function(file, part) cat("```r", read_part(file, part), "```", sep = "\n")
+run_script <- function(file) {
+  env <- new.env(parent = globalenv())
+  path <- system.file("scripts", file, package = "kits")
+  printed <- capture.output(suppressMessages(sys.source(path, envir = env)))
+  env
+}
+```
+
+kits 的結果記下呼叫它的那一行字（`info$call`）。
+所以一步一步接起來的結果和一次呼叫的結果，只有這一行字不同。
+`without_call()` 拿掉它，剩下的用 `identical()` 比：
+
+```{r}
+without_call <- function(x) {
+  x$info$call <- NULL
+  x
+}
+```
+
+
+## 1 連結的點
+
+### 1.1 這一步要做什麼
+
+M36 和 M03 是兩次校準。
+PCM 的量尺只定到原點和單位，所以兩次校準的量尺可以差一條直線。
+兩個世代都答的題（共同題），在兩邊各有一個門檻。
+同一個步驟的兩個門檻，就是一個「點」：`from` 在要轉換的量尺（M36），`to` 在目標量尺（M03）。
+
+### 1.2 公式
+
+$$
+(\mathit{from}_j,\ \mathit{to}_j) = \big(\mathit{thr}^{\text{M36}}_{ik},\ \mathit{thr}^{\text{M03}}_{ik}\big),
+\qquad j = (i, k)
+$$
+
+```latex
+(\mathit{from}_j,\ \mathit{to}_j) = \big(\mathit{thr}^{\text{M36}}_{ik},\ \mathit{thr}^{\text{M03}}_{ik}\big),
+\qquad j = (i, k)
+```
+
+* $i$ 是題，$k$ 是步驟；$\mathit{thr}_{ik}$ 是 RP50 的門檻：$P(X_i \ge k \mid \theta = \mathit{thr}_{ik}) = 0.5$。
+* 一個點的名字是 `"item_id:item_score"`。
+* 只有一邊有的步驟（例如一個世代沒有人到達的分數）不算點。
+
+### 1.3 手算
+
+兩個門檻表照 `item_id`、`item_score` 接起來：
+
+```{r}
+hand_points <- as_tibble(coef(item36)) |>
+  inner_join(as_tibble(coef(item03)), by = c("item_id", "item_score"),
+             suffix = c("_from", "_to")) |>
+  arrange(item_id, item_score) |>
+  transmute(id = paste0(item_id, ":", item_score), item = item_id, from = thr_from, to = thr_to)
+hand_points
+```
+
+### 1.4 用 kits
+
+`kits_link_points()` 是第 1 步：
+
+```{r}
+points <- kits_link_points(item36, item03)
+c(id = identical(hand_points$id, points$id),
+  from = identical(hand_points$from, points$from),
+  to = identical(hand_points$to, points$to))
+```
+
+`step = 1` 只用每題的 milestone step（第一個步驟），一題一個點。
+`algo_` 的積木沒有這一步：點本身只是兩個數字向量 `from`、`to`，再加上每個點屬於哪一題（`item`）。
+
+
+## 2 mean/sigma 線
+
+### 2.1 這一步要做什麼
+
+找一條直線，新的值 = 截距 + 斜率 × 舊的值。
+mean/sigma 讓點在兩邊的平均一樣、SD 也一樣（Marco, 1977；Kolen & Brennan, 2014）。
+照 Kolen & Brennan 的寫法，$A$ 是斜率（`slope`），$B$ 是截距（`intercept`）。
+kits 的物件不用字母，直接叫 `intercept`、`slope`。
+
+### 2.2 公式
+
+$$
+A = \frac{\mathrm{SD}(\mathit{to})}{\mathrm{SD}(\mathit{from})},\qquad
+B = \overline{\mathit{to}} - A\,\overline{\mathit{from}}
+$$
+
+```latex
+A = \frac{\mathrm{SD}(\mathit{to})}{\mathrm{SD}(\mathit{from})},\qquad
+B = \overline{\mathit{to}} - A\,\overline{\mathit{from}}
+```
+
+* SD 用 $n - 1$ 當分母（R 的 `sd()`）。
+* 用所有的點算的線叫 $A_0$、$B_0$（`slope0`、`intercept0`），第 3 節用它篩點。
+
+### 2.3 手算
+
+所有的點：
+
+```{r}
+from <- points$from
+to <- points$to
+A0 <- sd(to) / sd(from)
+B0 <- mean(to) - A0 * mean(from)
+c(intercept0 = B0, slope0 = A0)
+```
+
+### 2.4 用 kits
+
+`algo_mean_sigma()` 是這條公式本身：
+
+```{r}
+line0 <- algo_mean_sigma(from, to)
+c(intercept = identical(line0$intercept, B0), slope = identical(line0$slope, A0))
+```
+
+`kits_` 這一層沒有單獨的 mean/sigma；它在第 3 步裡（`intercept0`、`slope0`），第 3 節對答案。
+
+
+## 3 篩一次
+
+### 3.1 這一步要做什麼
+
+有些題在兩個世代的表現不一樣（題目偏移），它的點會把線拉歪。
+所以先用所有的點畫一條線，算每個點離線多遠（殘差）。
+離得太遠的點拿掉，再用留下來的點畫一次線。
+只篩一次，不重複。
+
+### 3.2 公式
+
+$$
+e_j = \mathit{to}_j - (B_0 + A_0\,\mathit{from}_j);\qquad
+\text{drop } j \text{ if } |e_j| > \mathit{cut}\cdot\mathrm{SD}(e)
+$$
+
+```latex
+e_j = \mathit{to}_j - (B_0 + A_0\,\mathit{from}_j);\qquad
+\text{drop } j \text{ if } |e_j| > \mathit{cut}\cdot\mathrm{SD}(e)
+```
+
+* $e_j$ 是點 $j$ 的殘差；$\mathit{cut}$ 預設是 2。
+* 篩完，用留下來的點再算一次第 2 節的 $A$、$B$。
+* 所有的點都在一條線上時（$\mathrm{SD}(e) \approx 0$），什麼都不拿掉。
+
+### 3.3 手算
+
+殘差和要拿掉的點：
+
+```{r}
+e <- to - B0 - A0 * from
+dropped <- abs(e) > 2 * sd(e)
+points$id[dropped]
+```
+
+留下的點再畫一次線：
+
+```{r}
+A <- sd(to[!dropped]) / sd(from[!dropped])
+B <- mean(to[!dropped]) - A * mean(from[!dropped])
+c(intercept = B, slope = A)
+```
+
+### 3.4 用 kits
+
+`algo_` 這一層：`algo_screen()` 篩一次，接到 `algo_mean_sigma()` 就只用留下的點。
+
+```{r}
+screen <- algo_screen(from, to, item = points$item)
+line <- screen |>
+  algo_mean_sigma()
+c(resid = identical(screen$resid, e), dropped = identical(screen$dropped, dropped),
+  intercept0 = identical(screen$intercept0, B0),
+  line = identical(c(line$intercept, line$slope), c(B, A)))
+```
+
+`kits_` 這一層：`kits_link_screen()` 是第 2 步，`kits_link_line()` 是第 3 步。
+
+```{r}
+screened <- kits_link_screen(points)
+link_line <- kits_link_line(screened)
+c(dropped = identical(screened$dropped, dropped), slope0 = identical(link_line$slope0, A0),
+  intercept = identical(link_line$intercept, B), slope = identical(link_line$slope, A))
+```
+
+`kits_link_line()` 給的是一條還沒有連結誤差的連結（`intercept_error` 是 NA）。
+
+### 3.5 畫出來
+
+灰色虛線是篩選前的線，藍色實線是最後的線，橘色的點被拿掉。
+
+```{r, fig.width = 6, fig.height = 4.5}
+ggplot(link_line$points, aes(from, to)) +
+  geom_abline(intercept = B0, slope = A0, colour = "#7F7F7F", linetype = "dashed") +
+  geom_abline(intercept = B, slope = A, colour = "#0072B2") +
+  geom_point(aes(colour = dropped)) +
+  scale_colour_manual(values = c(`FALSE` = "#0072B2", `TRUE` = "#D55E00")) +
+  labs(x = "threshold on lan M36 (from)", y = "threshold on lan M03 (to)")
+```
+
+`plot(link_line)` 畫同樣的圖，再加上篩選帶。
+點排成曲線而不是直線時，這條連結就不能照用。
+
+### 3.6 其他的篩選規則
+
+預設是 `spread = "sd"`、`unit = "step"`。
+`spread = "mad"` 用穩健的分散（`stats::mad()`），離群的點不會把篩選的範圍撐大；`spread = "se"` 用每個點自己的 SE。
+`unit = "item"`：一題有一個步驟被標出來，這一題的所有步驟都拿掉。
+
+$$
+\text{mad: } |e_j| > \mathit{cut}\cdot 1.4826\,\mathrm{MAD}(e);\qquad
+\text{se: } \frac{|e_j|}{\sqrt{\mathit{se}_{to,j}^2 + A_0^2\,\mathit{se}_{from,j}^2}} > \mathit{cut}
+$$
+
+```latex
+\text{mad: } |e_j| > \mathit{cut}\cdot 1.4826\,\mathrm{MAD}(e);\qquad
+\text{se: } \frac{|e_j|}{\sqrt{\mathit{se}_{to,j}^2 + A_0^2\,\mathit{se}_{from,j}^2}} > \mathit{cut}
+```
+
+`"se"` 只適合小樣本：門檻的 SE 隨人數變小，殘差不會，所以人多時它拿掉大部分的點。
+四種組合，兩層各算一次：
+
+```{r}
+rules <- tibble(spread = c("sd", "mad", "se", "sd"), unit = c("step", "step", "step", "item"))
+by_algo <- map2(rules$spread, rules$unit, \(s, u) {
+  algo_screen(from, to, points$item, spread = s, unit = u,
+              se_from = points$se_from, se_to = points$se_to)$dropped
+})
+by_kits <- map2(rules$spread, rules$unit, \(s, u) {
+  kits_link_screen(points, spread = s, unit = u)$dropped
+})
+mutate(rules, n_dropped = map_int(by_algo, sum), same = map2_lgl(by_algo, by_kits, identical))
+```
+
+### 3.7 教學程式
+
+教學程式是 `link.R`。
+它的示範是第 5 節的 D 連結（語言和動作接到錨題）；兩個校準之間的連結在 `slope` 段（第 8 節）。
+`line` 段就是第 2、3 節：
+
+```{r, results = "asis"}
+show_part("link.R", "line")
+```
+
+整份程式在乾淨的環境裡跑一次（約 10 秒），看它自己的 `compare` 段：
+
+```{r}
+env_link <- run_script("link.R")
+env_link$diffs
+```
+
+
+## 4 連結誤差：整題重抽
+
+### 4.1 這一步要做什麼
+
+換一組共同題，線會變一點。
+連結誤差回答：「如果共同題換一組，截距和斜率會差多少？」
+做法是重抽題目：每次從共同題中抽回同樣多的題（可以重複），重做第 2、3 步。
+同一題的步驟彼此相關，所以一題的所有步驟一起抽。
+每次重抽都重新篩，所以連結誤差也包括「篩掉哪些點」的不確定性。
+
+### 4.2 公式
+
+$$
+\mathrm{SE}(B) = \mathrm{SD}_{r=1..R}\big(B^{(r)}\big),\qquad
+\mathrm{SE}(A) = \mathrm{SD}_{r=1..R}\big(A^{(r)}\big)
+$$
+
+```latex
+\mathrm{SE}(B) = \mathrm{SD}_{r=1..R}\big(B^{(r)}\big),\qquad
+\mathrm{SE}(A) = \mathrm{SD}_{r=1..R}\big(A^{(r)}\big)
+```
+
+* $r$ 是一次重抽，$R$ 是重抽的次數（`n_boot`）。
+* 點太少、算不出線的重抽不算，另外數（`n_failed`）。
+* 這裡用 $R = 200$，幾秒就好；報告用 2000。
+* 截距和斜率的共變異數矩陣（`vcov`）第 7 節會用。
+
+### 4.3 手算
+
+一次重抽的線：篩一次，再畫線（第 2、3 節的手算，寫成一個函數）。
+
+```{r}
+link_once <- function(f, t) {
+  if (length(f) < 3 || sd(f) == 0 || sd(t) == 0) return(c(intercept = NA, slope = NA))
+  a0 <- sd(t) / sd(f)
+  r <- t - (mean(t) - a0 * mean(f)) - a0 * f
+  keep <- !(abs(r) > 2 * sd(r))
+  if (sum(keep) < 3) return(c(intercept = NA, slope = NA))
+  a <- sd(t[keep]) / sd(f[keep])
+  c(intercept = mean(t[keep]) - a * mean(f[keep]), slope = a)
+}
+```
+
+每題的點在哪幾列；一次抽題，就是抽這些列：
+
+```{r}
+items <- unique(points$item)
+rows <- split(seq_along(points$item), factor(points$item, levels = items))
+length(items)
+```
+
+200 次重抽，種子 1（和 kits 的預設相同）：
+
+```{r}
+set.seed(1)
+draws <- t(replicate(200, {
+  i <- unlist(rows[sample(items, replace = TRUE)], use.names = FALSE)
+  link_once(from[i], to[i])
+}))
+c(intercept_error = sd(draws[, "intercept"]), slope_error = sd(draws[, "slope"]))
+```
+
+### 4.4 用 kits
+
+`algo_link_error()` 接在 `algo_screen()` 後面，用同樣的點和篩選規則：
+
+```{r}
+err <- screen |>
+  algo_link_error(n_boot = 200, seed = 1)
+c(draws = identical(unname(err$draws), unname(draws)),
+  intercept_error = identical(err$intercept_error, sd(draws[, "intercept"])),
+  vcov = identical(unname(err$vcov), unname(cov(draws))))
+err$n_failed
+```
+
+`n_failed` 是算不出線的重抽：這裡一次都沒有。
+
+`kits_link_error()` 是第 4 步，接在 `kits_link_line()` 後面：
+
+```{r}
+co_steps <- link_line |>
+  kits_link_error(n_boot = 200)
+c(draws = identical(co_steps$draws, err$draws),
+  slope_error = identical(co_steps$slope_error, err$slope_error))
+```
+
+四步接起來，就是 `kits_linking()`；兩者只差記下來的那一行呼叫：
+
+```{r}
+co <- kits_linking(item36, item03, n_boot = 200)
+identical(without_call(co), without_call(co_steps))
+co
+```
+
+### 4.5 教學程式
+
+`link.R` 的 `error` 段：
+
+```{r, results = "asis"}
+show_part("link.R", "error")
+```
+
+`set.seed(seed)` 和 kits 用同一個種子，所以重抽的結果相同。
+最後的 `se_link()` 是第 7 節的公式：`V_draws` 是截距和斜率的共變異數矩陣。
+
+
+## 5 接到 D：錨題和 domain check
+
+### 5.1 這一步要做什麼
+
+錨題是和 GSED 相同的題目，`tau` 是 GSED 的難度，單位是 D。
+GSED 的題目是通過、沒通過，所以每個錨題只用一個步驟：通過步驟 $s$（預設 1，也就是至少 1 分）。
+`tau` 是 RP50 的值（一半的孩子通過的 D），所以點也用 RP50 的門檻。
+每個領域的錨題很少，所以幾個領域共用一條線（這裡是語言和動作）。
+
+用錨題接到 D，是把 KIT 的量尺對齊到 GSED 的 D（Kolen & Brennan, 2014, pp. 493-500）。
+等化要求構念、母群和施測條件都相同，這裡不是，所以叫校準（calibration）或量尺對齊（scale aligning）。
+換算後的 D 能怎麼解釋，要看 KIT 和 GSED 有多相似。
+
+### 5.2 公式
+
+點：
+
+$$
+(\mathit{from}_i,\ \mathit{to}_i) = \big(\mathit{thr}_{is},\ \tau^{\mathrm{GSED}}_i\big)
+$$
+
+```latex
+(\mathit{from}_i,\ \mathit{to}_i) = \big(\mathit{thr}_{is},\ \tau^{\mathrm{GSED}}_i\big)
+```
+
+線、篩選、重抽都和第 2–4 節相同。
+domain check 多看一件事：如果每個領域可以有自己的截距 $B_d$，但共用一個斜率 $A_s$，各領域的截距差多少？
+
+$$
+A_s = \sqrt{\frac{\sum (\mathit{to} - \overline{\mathit{to}}_d)^2}{\sum (\mathit{from} - \overline{\mathit{from}}_d)^2}},\qquad
+B_d = \overline{\mathit{to}}_d - A_s\,\overline{\mathit{from}}_d
+$$
+
+```latex
+A_s = \sqrt{\frac{\sum (\mathit{to} - \overline{\mathit{to}}_d)^2}{\sum (\mathit{from} - \overline{\mathit{from}}_d)^2}},\qquad
+B_d = \overline{\mathit{to}}_d - A_s\,\overline{\mathit{from}}_d
+```
+
+* $d$ 是領域；$\overline{\mathit{to}}_d$、$\overline{\mathit{from}}_d$ 是領域 $d$ 留下的點的平均。
+* 加總是所有留下的點，每個點減去自己領域的平均。
+* $A_s$ 只用來檢查，不是連結的斜率 $A$。
+  各領域的 $B_d$ 和共同的截距 $B$ 很接近，就支持共用一條線。
+
+### 5.3 手算：點
+
+兩個領域的門檻放在一起，留下通過步驟，接上 `tau`：
+
+```{r}
+thresholds <- bind_rows(lan = as_tibble(coef(item03)), motor = as_tibble(coef(item_motor)),
+                        .id = "domain")
+hand_anchor <- thresholds |>
+  filter(item_score == 1) |>
+  inner_join(select(kitm03$anchors, item_id, tau), by = "item_id") |>
+  arrange(item_id)
+count(hand_anchor, domain)
+```
+
+### 5.4 用 kits：點和線
+
+兩個校準放進一個有名字的 list；名字就是領域：
+
+```{r}
+domains <- list(lan = item03, motor = item_motor)
+anchor_points <- kits_link_points(domains, kitm03$anchors)
+c(from = identical(anchor_points$from, hand_anchor$thr),
+  to = identical(anchor_points$to, hand_anchor$tau),
+  domain = identical(anchor_points$domain, hand_anchor$domain))
+```
+
+四步接起來，和一次呼叫比：
+
+```{r}
+d_steps <- anchor_points |>
+  kits_link_screen() |>
+  kits_link_line() |>
+  kits_link_error(n_boot = 200)
+d_link <- kits_linking(list(lan = item03, motor = item_motor), kitm03$anchors, n_boot = 200)
+identical(without_call(d_link), without_call(d_steps))
+```
+
+```{r}
+d_link
+```
+
+### 5.5 手算：domain check
+
+留下的點，每個點減去自己領域的平均：
+
+```{r}
+kept <- as_tibble(d_link$points) |>
+  filter(!dropped) |>
+  mutate(dx = from - mean(from), dy = to - mean(to), .by = domain)
+A_s <- sqrt(sum(kept$dy^2) / sum(kept$dx^2))
+```
+
+每個領域的截距，和 kits 的 `domains` 表比：
+
+```{r}
+hand_domains <- kept |>
+  summarise(n = n(), intercept = mean(to) - A_s * mean(from), .by = domain) |>
+  arrange(domain)
+c(slope_s = identical(A_s, d_link$domains$slope[1]),
+  intercept_d = isTRUE(all.equal(hand_domains$intercept, d_link$domains$intercept,
+                                 tolerance = 1e-12)))
+```
+
+截距用 `all.equal()`（容許誤差 $10^{-12}$）：kits 的平均和這裡的加總順序不同，最後一位可能差一點。
+這份示範資料的語言只有 2 題錨題，所以語言的 $B_d$ 只靠 2 個點，看看就好。
+
+### 5.6 教學程式
+
+`link.R` 的 `points` 段和 `domains` 段（3.7 節已經跑過，`compare` 段的 `domains`、`slope_s` 是 0）：
+
+```{r, results = "asis"}
+show_part("link.R", "points")
+show_part("link.R", "domains")
+```
+
+
+## 6 換算：`kits_convert()`
+
+### 6.1 這一步要做什麼
+
+有了線，就能把分數從一條量尺換到另一條。
+$\theta$ 照線換；SE 只乘上斜率（平移不改變誤差的大小）。
+幾條連結可以接著用：M36 → M03 → D。
+兩條直線接起來還是一條直線。
+
+### 6.2 公式
+
+$$
+\theta^* = B + A\,\theta,\qquad \mathrm{SE}^* = A\,\mathrm{SE}
+$$
+
+```latex
+\theta^* = B + A\,\theta,\qquad \mathrm{SE}^* = A\,\mathrm{SE}
+```
+
+先用連結 1，再用連結 2：
+
+$$
+A = A_2 A_1,\qquad B = B_2 + A_2 B_1
+$$
+
+```latex
+A = A_2 A_1,\qquad B = B_2 + A_2 B_1
+```
+
+### 6.3 手算
+
+M36 的分數（在 lan M36 的量尺上）：
+
+```{r}
+persons36 <- distinct(lan36, visit_id, cohort, wave_m, age_m, sex)
+raw36 <- kits_subj(lan36, item36, persons = persons36)
+theta_03 <- co$intercept + co$slope * raw36$theta
+se_03 <- co$slope * raw36$se
+```
+
+再接到 D，以及合起來的一條線：
+
+```{r}
+theta_D <- d_link$intercept + d_link$slope * theta_03
+B_chain <- d_link$intercept + d_link$slope * co$intercept
+A_chain <- d_link$slope * co$slope
+c(intercept = B_chain, slope = A_chain)
+```
+
+### 6.4 用 kits
+
+`kits_` 這一層：`kits_convert()` 照順序套用連結，並檢查量尺。
+
+```{r}
+s03 <- raw36 |>
+  kits_convert(co)
+sD <- raw36 |>
+  kits_convert(co, d_link)
+c(theta = identical(s03$theta, theta_03), se = identical(s03$se, se_03),
+  theta_D = identical(sD$theta, theta_D))
+```
+
+`algo_` 這一層：`algo_line()` 套用一條線，或把一串線合成一條。
+
+```{r}
+chain <- algo_line(list(co, d_link))
+c(one = identical(algo_line(co, x = raw36$theta), theta_03),
+  two = identical(algo_line(d_link, x = algo_line(co, x = raw36$theta)), theta_D),
+  chain = identical(c(chain$intercept, chain$slope), c(B_chain, A_chain)))
+```
+
+用合起來的一條線一次換，和一條一條換，只差浮點運算的順序：
+
+```{r}
+all.equal(algo_line(chain, x = raw36$theta), sD$theta, tolerance = 1e-12)
+```
+
+`summary(sD)$conversion` 也列出這一串連結和合起來的線。
+順序錯了（先接 D 再接 M03），kits 會停下來：
+
+```{r}
+tryCatch(kits_convert(raw36, d_link, co), kits_error_scale = \(e) conditionMessage(e))
+```
+
+`algo_line()` 不記量尺，所以它不會檢查順序；這是兩層的分工。
+
+### 6.5 教學程式
+
+換算在分數的教學程式 `wle.R` 的 `convert` 段（[02_scoring](02_scoring.html) 讀整份）：
+
+```{r, results = "asis"}
+show_part("wle.R", "convert")
+```
+
+
+## 7 每個 θ 的連結誤差：`se_link`、`se_total`
+
+### 7.1 這一步要做什麼
+
+連結誤差和分數的位置有關。
+離共同題的中心越遠，斜率的誤差影響越大（Kolen & Brennan, 2014, pp. 249-252）。
+所以每個 $\theta$ 有自己的連結誤差 `se_link`。
+`se_total` 把孩子自己的測量誤差（`se`）和連結誤差合起來。
+
+### 7.2 公式
+
+一條線：$B_r + A_r\theta$ 在重抽之間的 SD。
+線是直線，所以 delta method 的式子剛好等於這個 SD。
+
+$$
+\mathrm{SE}_{\mathrm{link}}(\theta) = \mathrm{SD}_r(B_r + A_r\theta)
+= \sqrt{\mathrm{Var}(B) + \theta^2\,\mathrm{Var}(A) + 2\theta\,\mathrm{Cov}(A, B)}
+$$
+
+```latex
+\mathrm{SE}_{\mathrm{link}}(\theta) = \mathrm{SD}_r(B_r + A_r\theta)
+= \sqrt{\mathrm{Var}(B) + \theta^2\,\mathrm{Var}(A) + 2\theta\,\mathrm{Cov}(A, B)}
+```
+
+一串連結 $k = 1, \dots, K$：從 $m_0 = \theta$、$v_0 = 0$ 開始，一條一條走。
+
+$$
+m_k = B_k + A_k m_{k-1},\qquad
+v_k = \mathrm{Var}(B_k) + 2\,\mathrm{Cov}(A_k, B_k)\,m_{k-1} + \mathrm{Var}(A_k)\,(v_{k-1} + m_{k-1}^2) + A_k^2\,v_{k-1}
+$$
+
+```latex
+m_k = B_k + A_k m_{k-1},\qquad
+v_k = \mathrm{Var}(B_k) + 2\,\mathrm{Cov}(A_k, B_k)\,m_{k-1} + \mathrm{Var}(A_k)\,(v_{k-1} + m_{k-1}^2) + A_k^2\,v_{k-1}
+```
+
+$$
+\mathit{se\_link} = \sqrt{v_K},\qquad \mathit{se\_total} = \sqrt{\mathit{se}^2 + \mathit{se\_link}^2}
+$$
+
+```latex
+\mathit{se\_link} = \sqrt{v_K},\qquad \mathit{se\_total} = \sqrt{\mathit{se}^2 + \mathit{se\_link}^2}
+```
+
+* Var、Cov 用 $n - 1$ 當分母，所以 $\theta = 0$ 時就是 `intercept_error`。
+* 兩條連結用不同的題（共同題、錨題），所以把它們的重抽當成彼此獨立。
+  這是 Braun 和 Holland 的 delta method（Kolen & Brennan, 2014, p. 269），再加上一個小的乘積項 $\mathrm{Var}(A_k)\,v_{k-1}$。
+* 中心放在估計的線上，所以分兩次換算和一次換算的 `se_link` 相同。
+* `se_link` 只是「哪些題剛好是共同題或錨題」的抽樣誤差；它不含校準時孩子的抽樣誤差。
+
+### 7.3 手算：一條線
+
+四個 $\theta$（在 lan M36 的量尺上），直接算重抽之間的 SD，和用共變異數矩陣算：
+
+```{r}
+th <- c(-1, 0, 1, 2)
+sd_at <- map_dbl(th, \(t) sd(co$draws[, "intercept"] + co$draws[, "slope"] * t))
+V <- co$vcov
+se_formula <- sqrt(V[1, 1] + th^2 * V[2, 2] + 2 * th * V[1, 2])
+rbind(sd_over_draws = sd_at, formula = se_formula)
+```
+
+### 7.4 手算：一串連結
+
+一條連結的一步：從 $(m_{k-1}, v_{k-1})$ 到 $(m_k, v_k)$。
+
+```{r}
+next_link <- function(mv, l) {
+  B_r <- l$draws[, "intercept"]
+  A_r <- l$draws[, "slope"]
+  v <- var(B_r) + 2 * cov(B_r, A_r) * mv$m + var(A_r) * (mv$v + mv$m^2) + l$slope^2 * mv$v
+  list(m = l$intercept + l$slope * mv$m, v = v)
+}
+```
+
+M36 的每個孩子，走過 M36 → M03 → D：
+
+```{r}
+mv <- list(m = raw36$theta, v = 0 * raw36$theta)
+for (l in list(co, d_link)) mv <- next_link(mv, l)
+se_link_hand <- sqrt(pmax(mv$v, 0))
+se_total_hand <- sqrt(sD$se^2 + se_link_hand^2)
+```
+
+### 7.5 用 kits
+
+`kits_convert()` 在每條連結都有重抽時，加上 `se_link` 和 `se_total` 兩欄：
+
+```{r}
+c(se_link = identical(sD$se_link, se_link_hand), se_total = identical(sD$se_total, se_total_hand))
+as_tibble(sD) |>
+  select(theta, se, se_link, se_total) |>
+  head(4)
+```
+
+一條線，選定的 $\theta$：放進一張有 `theta` 欄的表，用 `from` 說它在哪一條量尺上。
+
+```{r}
+at_th <- kits_convert(tibble(theta = th), co, from = "lan M36")
+c(formula = identical(at_th$se_link, se_formula),
+  sd_over_draws = isTRUE(all.equal(at_th$se_link, sd_at, tolerance = 1e-12)))
+```
+
+直接算 SD 和用公式算只差浮點的順序，所以用 `all.equal()`（$10^{-12}$）。
+分兩次換算（先 `co`，再 `d_link`）也一樣：
+
+```{r}
+two_steps <- raw36 |>
+  kits_convert(co) |>
+  kits_convert(d_link)
+all.equal(two_steps$se_link, sD$se_link, tolerance = 1e-12)
+```
+
+`algo_` 這一層沒有 `se_link`：它只需要每條線的 `draws`，上面的 `next_link()` 就是全部。
+一條連結沒有重抽時（`n_boot = 0`），`kits_convert()` 不加這兩欄，並用訊息說是哪一條。
+
+## 8 斜率和 1 比
+
+### 8.1 這一步要做什麼
+
+PCM 沒有鑑別度參數，所以兩個 PCM 校準之間，理論上只差一個平移（斜率 $A = 1$）。
+Masters（1984）用 PCM 建題庫時，連結只用平移（Kolen & Brennan, 2014, p. 229）。
+kits 還是保留 mean/sigma 的自由斜率，因為 KIT 的題目在不同年齡的鑑別力可能不同。
+然後把 $A$ 和 1 比：差太多，表示量尺在兩次校準之間伸縮了，值得在報告裡說明。
+自由斜率還是照用，診斷只是註記。
+
+### 8.2 公式
+
+$$
+z = \frac{A - 1}{\mathrm{SE}_{\mathrm{link}}(A)};\qquad \text{note if } |z| > 2
+$$
+
+```latex
+z = \frac{A - 1}{\mathrm{SE}_{\mathrm{link}}(A)};\qquad \text{note if } |z| > 2
+```
+
+* $\mathrm{SE}_{\mathrm{link}}(A)$ 是 `slope_error`（第 4 節）。
+* 只有兩個校準之間的連結才比；接到錨題的連結兩邊單位不同（logit 和 D），不比。
+
+### 8.3 手算
+
+```{r}
+z_hand <- (co$slope - 1) / sd(co$draws[, "slope"])
+z_hand
+```
+
+### 8.4 用 kits
+
+連結的診斷表有一列 `slope vs 1`：
+
+```{r}
+slope_z <- function(link) filter(as_tibble(link$diagnostics), check == "slope vs 1")$value
+identical(slope_z(co), z_hand)
+```
+
+接到錨題的連結沒有這一列（長度 0）：
+
+```{r}
+length(slope_z(d_link))
+```
+
+`algo_` 這一層：`algo_link_error()` 的 `slope_error`，套進公式就是 $z$。
+
+```{r}
+identical((line$slope - 1) / err$slope_error, z_hand)
+```
+
+### 8.5 斜率不是 1 的例子
+
+用 `kits_sim()` 模擬兩個世代，12 題兩點計分，第 5–8 題是共同題。
+兩點計分的題只有一個步驟，門檻就是 $\beta$，所以容易看出預期的斜率。
+年長的世代，題目的鑑別力都是 1.4：$\theta$ 和 $\beta$ 都乘上 1.4，等於把 PCM 的量尺拉長。
+
+```{r}
+betas <- set_names(as.list(seq(-3, 3, length.out = 12)), sprintf("q%02d", 1:12))
+set.seed(3)
+young <- kits_sim(rnorm(500, -0.5), betas[1:8], seed = 1)
+old <- kits_sim(1.4 * rnorm(500, 0.5), map(betas[5:12], \(x) 1.4 * x), seed = 2)
+```
+
+年長世代的量尺是年輕世代的 1.4 倍，所以接回去的斜率應該接近 $1/1.4$：
+
+```{r}
+item_young <- kits_item(young, scale = "young")
+item_old <- kits_item(old, scale = "old (wide)")
+co_wide <- kits_linking(item_old, item_young, n_boot = 200)
+c(slope = co_wide$slope, expected = 1 / 1.4, z = slope_z(co_wide))
+```
+
+只有 4 個點，所以斜率離 $1/1.4$ 還有一段距離；但它離 1 超過 2 個連結誤差，診斷註記：
+
+```{r}
+as_tibble(co_wide$diagnostics) |>
+  filter(check == "slope vs 1") |>
+  select(check, value, status)
+```
+
+### 8.6 教學程式
+
+`link.R` 的 `slope` 段：示範資料 M36 的語言接到 M03（就是這份教學的 `co`）。
+
+```{r, results = "asis"}
+show_part("link.R", "slope")
+```
+
+3.7 節跑過的程式算出同樣的線和 $z$：
+
+```{r}
+env_link$diffs_slope
+```
+
+
+## 9 可重現的管線
+
+下面三段貼進一個新的 R session，只要 `library(kits)`，就得到和這份教學完全相同的結果。
+資料用 base R 的 `subset()`，不用 dplyr。
+
+```{r repro-data, eval = FALSE}
+library(kits)
+lan03 <- subset(kitm03$responses, domain == "lan")
+motor03 <- subset(kitm03$responses, domain == "motor")
+lan36 <- subset(kitm36$responses, domain == "lan")
+item03 <- kits_item(lan03, scale = "lan M03")
+item_motor <- kits_item(motor03, scale = "motor M03")
+item36 <- kits_item(lan36, scale = "lan M36")
+```
+
+連結：一次呼叫、四步的 `kits_` 管線、`algo_` 的積木。
+
+```{r repro-link, eval = FALSE}
+co <- kits_linking(item36, item03, n_boot = 200)
+co_steps <- kits_link_points(item36, item03) |>
+  kits_link_screen() |>
+  kits_link_line() |>
+  kits_link_error(n_boot = 200)
+pts <- kits_link_points(item36, item03)
+line <- algo_screen(pts$from, pts$to, pts$item) |>
+  algo_mean_sigma()
+err <- algo_screen(pts$from, pts$to, pts$item) |>
+  algo_link_error(n_boot = 200)
+```
+
+換算：M36 的分數接到 M03，再接到 D。
+
+```{r repro-convert, eval = FALSE}
+d_link <- kits_linking(list(lan = item03, motor = item_motor), kitm03$anchors, n_boot = 200)
+persons36 <- unique(lan36[c("visit_id", "cohort", "wave_m", "age_m", "sex")])
+sD <- lan36 |>
+  kits_subj(item36, persons = persons36) |>
+  kits_convert(co, d_link)
+```
+
+這份教學真的開一個新的 R session（`callr::r()`）跑這三段，再把結果帶回來比：
+
+```{r}
+code <- unlist(map(c("repro-data", "repro-link", "repro-convert"), knitr::knit_code$get))
+fresh <- callr::r(function(code) {
+  env <- new.env()
+  eval(parse(text = code), envir = env)
+  as.list(env)
+}, args = list(code = code))
+```
+
+```{r}
+c(co = identical(fresh$co, co), d_link = identical(fresh$d_link, d_link),
+  steps = identical(without_call(fresh$co_steps), without_call(co)),
+  line = identical(c(fresh$line$intercept, fresh$line$slope), c(co$intercept, co$slope)),
+  error = identical(fresh$err$draws, co$draws),
+  theta = identical(fresh$sD$theta, sD$theta), se_link = identical(fresh$sD$se_link, sD$se_link))
+```
+
+* `co` 和 `d_link` 連記下來的呼叫都相同，因為那一行字一樣。
+* 四步的管線和 `kits_linking()` 只差那一行字（`without_call()`）。
+* `algo_` 的積木給同樣的線和同樣的重抽，但不記量尺，也沒有診斷。
+
+
+## 10 整理
+
+| 步驟 | 公式 | `kits_` | `algo_` | 教學程式 |
+|---|---|---|---|---|
+| 點 | $(\mathit{thr}_{ik}, \mathit{thr}_{ik})$ 或 $(\mathit{thr}_{is}, \tau_i)$ | `kits_link_points()` | （兩個向量） | `link.R` `points` |
+| mean/sigma | $A = \mathrm{SD}(\mathit{to})/\mathrm{SD}(\mathit{from})$ | 在 `kits_link_screen()`、`kits_link_line()` 裡 | `algo_mean_sigma()` | `line` |
+| 篩一次 | $|e_j| > \mathit{cut}\,\mathrm{SD}(e)$ | `kits_link_screen()` | `algo_screen()` | `line`、`rules` |
+| 連結誤差 | $\mathrm{SD}_r(B_r)$、$\mathrm{SD}_r(A_r)$ | `kits_link_error()` | `algo_link_error()` | `error` |
+| domain check | $A_s$、$B_d$ | `kits_link_line()` 的 `domains` | （手算） | `domains` |
+| 換算 | $\theta^* = B + A\theta$ | `kits_convert()` | `algo_line()` | `wle.R` `convert` |
+| `se_link` | $m_k$、$v_k$ | `kits_convert()` | （`draws` + 手算） | `error` |
+| 斜率和 1 比 | $z = (A - 1)/\mathrm{SE}(A)$ | `link$diagnostics` | `slope_error` | `slope` |
+
+一個新的波次要用固定參數校準之前，先看哪些題變了（`kits_drift()`）。
+它用的是同一條篩過一次的 mean/sigma 線；見 [05_checks](05_checks.html)。
+
+全部算完的時間：
+
+```{r}
+round(difftime(Sys.time(), t_start, units = "secs"))
+```
+
+**下一步：** [04_norms](04_norms.html)：用換算好的 D 做常模。
+
+
+## 參考文獻
+
+* Kolen, M. J., & Brennan, R. L. (2014). *Test equating, scaling, and linking* (3rd ed.). Springer. doi:10.1007/978-1-4939-0317-7
+* Marco, G. L. (1977). Item characteristic curve solutions to three intractable testing problems. *Journal of Educational Measurement, 14*(2), 139-160. doi:10.1111/j.1745-3984.1977.tb00033.x
+* Masters, G. N. (1984). Constructing an item bank using partial credit scoring. *Journal of Educational Measurement, 21*(1), 19-32. doi:10.1111/j.1745-3984.1984.tb00218.x
+* Weber, A. M., Rubio-Codina, M., Walker, S. P., van Buuren, S., Eekhout, I., et al. (2019). The D-score: a metric for interpreting the early development of infants and toddlers across global settings. *BMJ Global Health, 4*(6), e001724. doi:10.1136/bmjgh-2019-001724
+* R Core Team (2026). *R: A language and environment for statistical computing*. R Foundation for Statistical Computing, Vienna, Austria. https://www.R-project.org/

@@ -1,0 +1,946 @@
+---
+title: "kits 的演算法 6：量尺的性質"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    embed-resources: true
+    from: markdown+east_asian_line_breaks
+    grid:
+      body-width: 1100px
+---
+
+```{=html}
+<style>
+.MathJax_Display, mjx-container { overflow-x: auto; overflow-y: hidden; }
+</style>
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+options(width = 100)
+library(kits)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+t_start <- Sys.time()
+```
+
+## 0 這份教學
+
+校準、計分、連結和常模（[01](01_calibration.html)–[04](04_norms.html)）做好以後，量尺本身還有幾個問題要問：
+
+1. 一個題本在量尺的每個位置量得多準？（第 2、3 節：訊息、精準度）
+2. 兩個題本的原始分怎麼對照？（第 4 節；分量表在 [07](07_subscales.html)）
+3. 所有世代放在同一條量尺上，成長和分散看起來合理嗎？（第 5 節：垂直量尺）
+4. 世代連結和不用共同題的算法一致嗎？（第 6 節：連結檢查）
+5. kits 和 kitsPreview（dexter、cNORM）給同樣的數字嗎？（第 7 節）
+
+你會學到：
+
+* 每一步是做什麼用的，和它的公式（數學式，和可以一鍵複製的 `latex` 區塊）。
+* 在模擬資料上一步一步手算，和 kits、`algo_` 的結果比（印出 `TRUE`）。
+* 教學程式 `information.R` 在哪一段，和怎麼執行。
+* 貼到新的 R 就能重做的流程（第 8 節）。
+
+你需要：
+
+* [01 校準](01_calibration.html)、[02 計分](02_scoring.html)（WLE）、[03 連結](03_linking.html)（mean/sigma、連結誤差）。
+* 模型的程式在 [kits 的模型](../tutorial_models/kits_models.html)；這裡指過去，不重複。
+* 套件：kits，和 dplyr、tidyr、purrr、tibble、ggplot2（`library()` 這六個）。
+
+### 0.1 小工具
+
+和 [05](05_checks.html) 相同的四個小工具。
+`script_part()` 讀出教學程式的一段：
+
+```{r}
+script_part <- function(file, part) {
+  lines <- readLines(system.file("scripts", file, package = "kits"))
+  start <- grep(sprintf("^# ==== part: %s ====", part), lines)
+  if (length(start) != 1) stop("no part ", part, " in ", file)
+  marks <- grep("^# ==== ", lines)
+  end <- c(marks[marks > start], length(lines) + 1)[1] - 1
+  cat("```r", lines[start:end], "```", sep = "\n")
+}
+```
+
+`run_script()` 在新的環境裡執行整份教學程式：
+
+```{r}
+run_script <- function(file) {
+  env <- new.env(parent = globalenv())
+  path <- system.file("scripts", file, package = "kits")
+  printed <- capture.output(suppressMessages(sys.source(path, envir = env)))
+  env
+}
+```
+
+`run_fresh()` 把這份文件的程式區塊（一個或幾個）放到只有 `library(kits)` 的新 R 裡執行：
+
+```{r}
+run_fresh <- function(labels) {
+  code <- paste(unlist(map(labels, knitr::knit_code$get)), collapse = "\n")
+  callr::r(\(code) {
+    library(kits)
+    eval(parse(text = code), envir = globalenv())
+  }, args = list(code = code))
+}
+```
+
+`same()` 容許 $10^{-12}$ 的相對誤差（加總的順序不同）；完全相同的地方用 `identical()`。
+
+```{r}
+same <- function(a, b, tol = 1e-12) {
+  isTRUE(all.equal(as.vector(a), as.vector(b), tolerance = tol))
+}
+```
+
+### 0.2 演算法一覽
+
+```{r}
+kits_algorithm("information")
+```
+
+第 2、3 節照這些步驟做一次。
+
+## 1 資料
+
+一個領域，10 題；第 1、4、9 題兩點計分，其他三點計分。
+
+```{r}
+set.seed(7)
+b <- seq(-2.5, 3, length.out = 10)
+betas <- map(b, \(x) x + c(-0.5, 0.5))
+betas[c(1, 4, 9)] <- b[c(1, 4, 9)]
+names(betas) <- sprintf("lan%02d", 1:10)
+```
+
+兩個世代：M03 有 12、24、36 個月三波，M36 有 36、48 個月兩波。
+兩個世代都有 36 個月（第 5、6 節要用）。
+
+```{r}
+persons <- tibble(cohort = rep(c("M03", "M36"), c(600, 400)),
+                  wave_m = rep(c(12, 24, 36, 36, 48), each = 200)) |>
+  mutate(visit_id = paste(cohort, wave_m, 1:200, sep = "_"),
+         age_m = wave_m + runif(n(), -1, 1),
+         sex = sample(c("boy", "girl"), n(), replace = TRUE))
+theta <- 1.8 * log(persons$age_m / 12) + rnorm(1000, 0, 0.9)
+m03 <- persons$cohort == "M03"
+```
+
+M03 答第 1–8 題（12 個月不答第 7、8 題，36 個月不答第 1、2 題），M36 答第 5–10 題：
+
+```{r}
+X03 <- kits_sim(theta[m03], betas[1:8], seed = 1)
+rownames(X03) <- persons$visit_id[m03]
+w03 <- persons$wave_m[m03]
+X03[w03 == 12, c("lan07", "lan08")] <- NA
+X03[w03 == 36, c("lan01", "lan02")] <- NA
+X36 <- kits_sim(theta[!m03], betas[5:10], seed = 2)
+rownames(X36) <- persons$visit_id[!m03]
+```
+
+校準、計分，再把 M36 連結到 M03 的量尺（[03](03_linking.html)）：
+
+```{r}
+item03 <- kits_item(X03, scale = "lan M03")
+item36 <- kits_item(X36, scale = "lan M36")
+co <- kits_linking(item36, item03, n_boot = 200)
+s03 <- kits_subj(X03, item03, persons = persons)
+s36 <- kits_subj(X36, item36, persons = persons)
+```
+
+手算用的步驟參數，一題一個向量（`algo_cml()` 和 `kits_item()` 是同一個 CML）：
+
+```{r}
+beta_of <- (kits_stats(X03) |> algo_cml())$betas
+identical(unlist(beta_of, use.names = FALSE), coef(item03)$beta)
+```
+
+## 2 訊息和期望分數
+
+### 2.1 做什麼用
+
+訊息 $I(\theta)$ 說的是：在能力 $\theta$ 附近，這些題分得多開。
+訊息大，估計的 SE 小（約 $1/\sqrt{I}$）。
+期望分數（測驗特徵曲線）是能力 $\theta$ 的孩子平均拿幾分；第 4 節的真分數等化用它。
+兩個都只用題目參數，不用孩子的資料。
+
+### 2.2 公式
+
+$$
+P_{ik}(\theta) = \frac{\exp(k\theta - \sum_{g=1}^{k}\beta_{ig})}{\sum_{h=0}^{m_i}\exp(h\theta - \sum_{g=1}^{h}\beta_{ig})},\quad
+E_i(\theta) = \sum_k k\,P_{ik},\quad
+I(\theta) = \sum_i \sum_k (k - E_i)^2 P_{ik},\quad
+\frac{d}{d\theta}\sum_i E_i(\theta) = I(\theta)
+$$
+
+```latex
+P_{ik}(\theta) = \frac{\exp(k\theta - \sum_{g=1}^{k}\beta_{ig})}{\sum_{h=0}^{m_i}\exp(h\theta - \sum_{g=1}^{h}\beta_{ig})},\quad
+E_i(\theta) = \sum_k k\,P_{ik},\quad
+I(\theta) = \sum_i \sum_k (k - E_i)^2 P_{ik},\quad
+\frac{d}{d\theta}\sum_i E_i(\theta) = I(\theta)
+```
+
+* 一題的訊息就是它分數的變異數（PCM）。
+* 期望分數的斜率就是訊息。
+* 訊息的斜率 $I'(\theta)$ 是每題分數的三階中央動差加起來；kits 用 RTMB 自動微分（[模型教學](../tutorial_models/kits_models.html) 第 9.1 節）。
+
+### 2.3 手算
+
+一題在一個 $\theta$ 的類別機率：
+
+```{r}
+pcm <- function(theta, beta) {
+  eta <- cumsum(c(0, theta - beta))
+  exp(eta - max(eta)) / sum(exp(eta - max(eta)))
+}
+pcm(0.5, beta_of$lan02)
+```
+
+每題的期望分數和變異數，加起來：
+
+```{r}
+th <- c(-4, -2, 0, 2, 4)
+item_E <- function(t, beta) sum(seq_along(pcm(t, beta)) * pcm(t, beta)) - 1
+item_V <- function(t, beta) sum((seq_along(pcm(t, beta)) - 1 - item_E(t, beta))^2 * pcm(t, beta))
+E_hand <- map_dbl(th, \(t) sum(map_dbl(beta_of, \(b) item_E(t, b))))
+I_hand <- map_dbl(th, \(t) sum(map_dbl(beta_of, \(b) item_V(t, b))))
+```
+
+斜率用數值微分看一次：
+
+```{r}
+h <- 1e-5
+E_at <- function(t) sum(map_dbl(beta_of, \(b) item_E(t, b)))
+slope_num <- map_dbl(th, \(t) (E_at(t + h) - E_at(t - h)) / (2 * h))
+same(slope_num, I_hand, tol = 1e-8)
+```
+
+數值微分的誤差約 $h^2$，所以這裡容許 $10^{-8}$。
+
+### 2.4 用 kits 和 `algo_`
+
+`kits_information()`、`kits_expected_score()` 各回傳一個 $\theta$ 的函數：
+
+```{r}
+info03 <- kits_information(item03)
+expected03 <- kits_expected_score(item03)
+c(information = same(info03(th), I_hand), expected = same(expected03(th), E_hand))
+```
+
+`algo_pcm()` 是一題的核心；把每題的 `Var`、`E` 加起來，和 kits 完全相同：
+
+```{r}
+I_algo <- map(beta_of, \(b) algo_pcm(th, b)$Var) |> reduce(`+`)
+E_algo <- map(beta_of, \(b) algo_pcm(th, b)$E) |> reduce(`+`)
+c(identical(I_algo, info03(th)), identical(E_algo, expected03(th)))
+```
+
+`kits_pcm_prob()` 一次給機率、每題的動差，和整個測驗的三個數字：
+
+```{r}
+pp <- kits_pcm_prob(item03, th)
+pp$test
+M3 <- map(beta_of, \(b) algo_pcm(th, b, third = TRUE)$M3) |> reduce(`+`)
+same(M3, pp$test$information_slope)
+```
+
+`information_slope` 是 RTMB 對 $I(\theta)$ 的導數；它等於三階中央動差的和。
+
+### 2.5 教學程式：`information.R`
+
+分兩段：`information`（第 1 步）和 `expected_score`（第 2–3 步，RTMB 驗證斜率就是訊息）。
+
+```{r}
+#| output: asis
+script_part("information.R", "expected_score")
+```
+
+它在示範資料 `kitm03` 上執行，最後和 kits 比：
+
+```{r}
+env_info <- run_script("information.R")
+env_info$diffs
+all(env_info$diffs < 1e-10)
+max(abs(env_info$slope - env_info$information(env_info$theta)))
+```
+
+## 3 精準度：`kits_precision()`
+
+### 3.1 做什麼用
+
+訊息說的是「大約」多準。
+`kits_precision()` 問得更直接：真正能力是 $\theta$ 的孩子答這個題本，他的 WLE 平均落在哪、散多開？
+它不用模擬，用 Lord–Wingersky 遞迴算出每個原始分的機率，再加總。
+
+### 3.2 公式
+
+原始分的分布，一題一題加上去：
+
+$$
+f_j(x \mid \theta) = \sum_{k=0}^{m_j} f_{j-1}(x - k \mid \theta)\, P_{jk}(\theta),\quad f_0(0 \mid \theta) = 1
+$$
+
+```latex
+f_j(x \mid \theta) = \sum_{k=0}^{m_j} f_{j-1}(x - k \mid \theta)\, P_{jk}(\theta),\quad f_0(0 \mid \theta) = 1
+```
+
+WLE 的平均、偏誤、SD 和 RMSE：
+
+$$
+E[\hat\theta \mid \theta] = \sum_r P(r \mid \theta)\,\hat\theta(r),\quad
+\mathrm{bias} = E[\hat\theta \mid \theta] - \theta,\quad
+\mathrm{SD} = \sqrt{\sum_r P(r \mid \theta)\,\hat\theta(r)^2 - E^2},\quad
+\mathrm{RMSE} = \sqrt{\mathrm{bias}^2 + \mathrm{SD}^2}
+$$
+
+```latex
+E[\hat\theta \mid \theta] = \sum_r P(r \mid \theta)\,\hat\theta(r),\quad
+\mathrm{bias} = E[\hat\theta \mid \theta] - \theta,\quad
+\mathrm{SD} = \sqrt{\sum_r P(r \mid \theta)\,\hat\theta(r)^2 - E^2},\quad
+\mathrm{RMSE} = \sqrt{\mathrm{bias}^2 + \mathrm{SD}^2}
+```
+
+* $\hat\theta(r)$：這個題本原始分 $r$ 的 WLE（0 分和滿分也有）。
+* SD 就是條件測量標準誤（Kolen & Brennan, 2014, pp. 463-464）。
+* 可用範圍：RMSE 最小的點周圍、連續的一段格點，RMSE 小於 `criterion`（預設 1 logit）。
+  RMSE 1 logit 在 SD 是 $s$ 的孩子裡，信度約 $1 - 1/s^2$。
+
+### 3.3 手算
+
+加上一題：`f` 是前面幾題的分布（一列一個 $\theta$），`P` 是這一題的類別機率。
+
+```{r}
+add_item <- function(f, P) {
+  g <- matrix(0, nrow(f), ncol(f) + ncol(P) - 1)
+  for (k in seq_len(ncol(P)) - 1) {
+    cols <- seq_len(ncol(f)) + k
+    g[, cols] <- g[, cols] + f * P[, k + 1]
+  }
+  g
+}
+```
+
+從 0 題（原始分一定是 0）開始，一題一題加：
+
+```{r}
+lw <- function(theta, items) {
+  f <- matrix(1, length(theta), 1)
+  for (i in items) f <- add_item(f, t(sapply(theta, pcm, beta = beta_of[[i]])))
+  f
+}
+```
+
+先在一個很小的題本（lan01、lan02、lan04）上看它對不對：只有 $2 \times 3 \times 2 = 12$ 種分數組合，可以直接列出來。
+
+```{r}
+tiny <- c("lan01", "lan02", "lan04")
+grid <- expand.grid(lan01 = 0:1, lan02 = 0:2, lan04 = 0:1)
+one_pattern <- function(t, x) prod(map2_dbl(tiny, x, \(i, k) pcm(t, beta_of[[i]])[k + 1]))
+prob_of <- function(t) apply(grid, 1, \(x) one_pattern(t, x))
+by_enum <- tapply(prob_of(0.5), rowSums(grid), sum)
+same(by_enum, lw(0.5, tiny))
+```
+
+24 個月的題本（lan01–lan08），每個原始分的 WLE 用 `algo_jme()`：
+
+```{r}
+form24 <- sprintf("lan%02d", 1:8)
+grid_theta <- seq(-6, 6, by = 0.1)
+P_r <- lw(grid_theta, form24)
+wle_r <- algo_jme(beta_of[form24])$theta
+same(P_r, algo_lw(grid_theta, beta_of[form24]))
+```
+
+照公式算平均、SD、RMSE：
+
+```{r}
+expected <- drop(P_r %*% wle_r)
+sd_hat <- sqrt(drop(P_r %*% wle_r^2) - expected^2)
+rmse <- sqrt((expected - grid_theta)^2 + sd_hat^2)
+```
+
+可用範圍：從 RMSE 最小的點往兩邊走，直到 RMSE 不再小於 1。
+
+```{r}
+best <- which.min(rmse)
+ok <- rmse < 1
+lo <- hi <- best
+while (lo > 1 && ok[lo - 1]) lo <- lo - 1
+while (hi < length(ok) && ok[hi + 1]) hi <- hi + 1
+c(from = grid_theta[lo], to = grid_theta[hi], min_rmse = rmse[best])
+```
+
+### 3.4 用 kits
+
+`forms` 給 `kits_subj_table()` 的結果，就是每個波次的標準題本：
+
+```{r}
+tab03 <- kits_subj_table(s03)
+prec <- kits_precision(item03, tab03)
+prec
+```
+
+和手算比：
+
+```{r}
+p24 <- filter(as.data.frame(prec), form == "wave 24")
+r24 <- filter(attr(prec, "ranges"), form == "wave 24")
+c(expected = same(expected, p24$expected), sd = same(sd_hat, p24$sd), rmse = same(rmse, p24$rmse),
+  range = same(c(grid_theta[lo], grid_theta[hi]), c(r24$from, r24$to)))
+```
+
+三個題本的 RMSE 曲線：
+
+```{r}
+#| fig-width: 7
+#| fig-height: 3.5
+ggplot(as.data.frame(prec), aes(theta, rmse, colour = form)) +
+  geom_hline(yintercept = 1, colour = "#7F7F7F", linetype = "dashed") +
+  geom_line(linewidth = 0.8) +
+  scale_colour_manual(values = c("#0072B2", "#D55E00", "#7F7F7F")) +
+  coord_cartesian(ylim = c(0, 3)) +
+  labs(x = "theta (lan M03)", y = "RMSE of the WLE", colour = NULL) +
+  theme_minimal()
+```
+
+量尺兩端的 RMSE 比中間大很多：題本只在中間量得準。
+`link =` 把結果換到另一條量尺（例如 D）；`criterion` 預設也跟著乘上斜率。
+
+## 4 原始分對照：`kits_subj_table()` 加 `kits_expected_score()`
+
+### 4.1 做什麼用
+
+12 個月的題本（lan01–lan06）拿 5 分，等於 36 個月的題本（lan03–lan08）的幾分？
+
+kits 用 $\theta$ 計分，所以其實不需要這張表。
+用 IRT 的能力計分時，兩個題本的分數之間不必再建立關係（Kolen & Brennan, 2014, §6.4, p. 191）。
+PCM 的原始分是充分統計量：同一個題本，原始分相同，$\theta$ 就相同。
+所以原始分 → $\theta$ 的換算表（`kits_subj_table()`，[02](02_scoring.html)）本身就是計分。
+
+對照表只是幫忙讀原始分，分兩步：
+
+1. F 題本的原始分 → $\theta$（換算表）。
+2. $\theta$ → T 題本的期望分數（第 2 節的 `kits_expected_score()`）。
+
+兩個題本的題目在同一個校準裡，所以兩步都在同一條量尺上。
+
+### 4.2 公式
+
+T 題本的真分數 $T_T(\theta)$ 是它的期望總分；F 題本原始分 $r$ 的對照分數：
+
+$$
+e(r) = T_T\big(\hat\theta_F(r)\big),\quad T_T(\theta) = \sum_{i \in T} E_i(\theta);\qquad
+\text{MLE: } \hat\theta_F(r) = T_F^{-1}(r),\ 0 < r < K_F;\quad e(0) = 0,\ e(K_F) = K_T
+$$
+
+```latex
+e(r) = T_T\big(\hat\theta_F(r)\big),\quad T_T(\theta) = \sum_{i \in T} E_i(\theta);\qquad
+\text{MLE: } \hat\theta_F(r) = T_F^{-1}(r),\ 0 < r < K_F;\quad e(0) = 0,\ e(K_F) = K_T
+```
+
+* $K_F$、$K_T$：兩個題本的滿分。
+* 真分數等化（Kolen & Brennan, 2014, §6.5, pp. 192-197）解 $T_F(\theta) = r$。
+  PCM 的這個解就是 MLE；0 分和滿分沒有解，所以直接 0 對 0、滿分對滿分。
+* kits 的換算表用 WLE（Warm, 1989）：0 分和滿分也有 $\theta$。
+  所以 $e(0)$ 大於 0，$e(K_F)$ 小於 $K_T$；兩種差最多的是兩端（第 4.4 節的例子）。
+* 真分數的關係本來是真分數對真分數。
+  拿它來換觀察到的原始分，沒有理論上的根據；它的根據是實證的：和觀察分數等化的結果很接近（§6.5.4, pp. 196-197；Lord & Wingersky, 1984）。
+* 它只用題目參數，不依賴孩子的能力分布（§6.7, p. 201）。
+
+另一種做法是觀察分數等化（§6.6, pp. 198-200）。
+它用 Lord–Wingersky 遞迴（第 3 節）算出兩個題本原始分的分布，對一個能力分布平均，再用等百分位對齊。
+它要先選一個能力分布；KIT 各波次的能力差很多，選 12 個月或 36 個月的孩子，答案就不同，所以這裡用真分數。
+
+### 4.3 手算
+
+兩個題本，和一個題本的真分數 $T(\theta)$：
+
+```{r}
+from12 <- sprintf("lan%02d", 1:6)
+to36 <- sprintf("lan%02d", 3:8)
+tcc <- function(t, items) sum(map_dbl(beta_of[items], \(b) item_E(t, b)))
+```
+
+MLE：`uniroot()` 找 $T_F(\theta) = r$ 的 $\theta$。
+WLE：每個原始分的 WLE 用 `algo_jme()`（第 3.3 節也用它）。
+兩種 $\theta$ 都再算 T 題本的期望分數：
+
+```{r}
+theta_of_raw <- function(r) uniroot(\(t) tcc(t, from12) - r, c(-20, 20), tol = 1e-12)$root
+K12 <- sum(lengths(beta_of[from12]))
+theta_r <- map_dbl(1:(K12 - 1), theta_of_raw)
+equiv_mle <- c(0, map_dbl(theta_r, tcc, items = to36), sum(lengths(beta_of[to36])))
+wle_12 <- algo_jme(beta_of[from12])$theta
+equiv_wle <- map_dbl(wle_12, tcc, items = to36)
+```
+
+### 4.4 用 kits
+
+第 3.4 節的 `tab03` 已經有每一波標準題本的換算表；12 個月的標準題本就是 lan01–lan06。
+
+```{r}
+tab12 <- filter(tab03, wave_m == 12)
+expected36 <- kits_expected_score(item03, items = to36)
+equiv_kits <- expected36(tab12$theta)
+```
+
+和手算比：
+
+```{r}
+forms12 <- filter(attr(tab03, "forms"), wave_m == 12, form == 1)
+c(form = identical(forms12$items, toString(from12)), theta = same(tab12$theta, wle_12, tol = 1e-8),
+  equivalent = same(equiv_kits, equiv_wle))
+```
+
+MLE 和 WLE 兩種對照放在一起：
+
+```{r}
+tibble(raw = tab12$raw, theta_MLE = c(-Inf, theta_r, Inf), theta_WLE = tab12$theta,
+       e_MLE = equiv_mle, e_WLE = equiv_kits) |>
+  mutate(across(-raw, \(x) round(x, 2)))
+```
+
+* 中間的分數，兩個 $\theta$ 很接近，對照分數也很接近。
+* 兩端 WLE 往中間拉：0 分對到 `r round(first(equiv_kits), 2)` 分，滿分對到 `r round(last(equiv_kits), 1)` 分（滿分 `r last(equiv_mle)`）。
+* `kits_subj_table()` 和 `algo_jme()` 都是疊代到容許誤差就停，所以兩邊的 WLE 比較時容許 $10^{-8}$。
+
+### 4.5 沒有共同題也可以
+
+兩個題本自己不必有共同題，只要它們的題目在**同一條量尺**上。
+同一條量尺是校準（或連結）給的：共同題可以在中間的波次，把整條鏈串起來。
+
+示範資料 `kitm03` 的語言：3–24 個月答 lana01–06，36–72 個月答 lanb01–09，兩組沒有共同題。
+lanc01–09 在 3、6 個月只有一、兩題，12 到 72 個月九題都答，所以全部在同一個校準裡：
+
+```{r}
+lan03 <- kitm03$responses |> filter(domain == "lan") |> kits_resp()
+item_lan <- kits_item(lan03, scale = "lan M03")
+items_a <- sprintf("lana%02d", 1:6)
+items_b <- sprintf("lanb%02d", 1:9)
+intersect(items_a, items_b)
+```
+
+lana01–06 不是任何一波的標準題本，所以把它的題目參數挑出來，給 `kits_subj_table()`：
+
+```{r}
+tab_a <- kits_subj_table(filter(coef(item_lan), item_id %in% items_a))
+expected_b <- kits_expected_score(item_lan, items = items_b)
+tibble(raw = tab_a$raw, theta = round(tab_a$theta, 2), lanb = round(expected_b(tab_a$theta), 2))
+```
+
+* 這張對照表只用題目參數：每一波都一樣。
+* 這兩份題目難度差很多：lana 的 0–12 分都對到 lanb 的不到 1 分，lana 滿分只對到 lanb 的 `r round(expected_b(max(tab_a$theta)), 1)` 分（滿分 27）。
+  能力落在兩份題目都量得到的地方時，對照才可靠；兩份題目幾乎不重疊時，這張表大部分是外插。
+* 兩份題目給的年齡差很多時，比 $\theta$（或 D）比對照原始分好（[02](02_scoring.html)）。
+
+**不必限定題本。**
+任何兩組題目，只要在同一條量尺上，都可以這樣對照：整個領域的題本、一個分量表，或自己挑的一組題。
+意思是「平均而言」：$\theta$ 相同的孩子，在 F 題本的原始分是 $r$，在 T 題本的期望分數是 $e(r)$；個別孩子的原始分仍有誤差，兩份題本的信度也不同。
+原始分是每題分數的加總（一題 0–3 或 0–4 分），不是答對幾題。
+跨波次比較一個分量表的分數，和它的 SE、成長模型、模擬檢查，在 [07 分量表](07_subscales.html)。
+
+### 4.6 兩個世代：經過連結
+
+M36 的 84 個月題本（含 land 題）在 M36 的校準裡，lanb 在 M03 的校準裡。
+接起來要三步：原始分 → M36 的 $\theta$ → 連結 $\theta_{03} = B + A\,\theta_{36}$ → M03 題本的期望分數。
+
+```{r}
+lan36 <- kitm36$responses |> filter(domain == "lan") |> kits_resp()
+item_lan36 <- kits_item(lan36, scale = "lan M36")
+co_lan <- kits_linking(item_lan36, item_lan)
+booklet_84 <- kitm36$responses |>
+  filter(domain == "lan", wave_m == 84) |>
+  count(item_id) |>
+  filter(n >= 0.5 * max(n)) |>
+  pull(item_id)
+```
+
+手算（MLE）：
+
+```{r}
+betas_of <- function(item) split(coef(item)$beta, coef(item)$item_id)
+tcc_of <- function(t, betas) sum(map_dbl(betas, \(b) item_E(t, b)))
+b84 <- betas_of(item_lan36)[booklet_84]
+bb <- betas_of(item_lan)[items_b]
+K84 <- sum(lengths(b84))
+```
+
+```{r}
+theta36 <- map_dbl(1:(K84 - 1), \(r) uniroot(\(t) tcc_of(t, b84) - r, c(-20, 20), tol = 1e-10)$root)
+theta03 <- co_lan$intercept + co_lan$slope * theta36
+tibble(raw_84m = 1:(K84 - 1), theta_M03 = round(theta03, 2),
+       lanb_equivalent = round(map_dbl(theta03, tcc_of, betas = bb), 2)) |>
+  slice(seq(1, K84 - 1, by = 5))
+```
+
+* 用 WLE 也是同樣三步：`kits_subj_table()` 給 M36 的 $\theta$，代入連結的直線 $\theta_{03} = B + A\,\theta_{36}$，再給 `kits_expected_score(item_lan, items = items_b)`。
+* `kits_convert()` 換過的題目表不能直接用：它換了門檻，`beta` 還在 M36 的量尺。
+  `kits_expected_score()` 和 `kits_subj_table()` 用的是 `beta`，所以它們的 $\theta$ 仍是 M36 的量尺。
+* 連結的斜率 $A \ne 1$ 時，M36 的題放到 M03 的量尺上，鑑別度變成 $1/A$，不再是斜率 1 的 PCM；所以要經過連結算，不能只把參數平移。
+* 用 M03 還是 D 當共同量尺，對照表一樣：兩個題本的期望分數跟著同一條直線走。
+* 這張對照表還帶著連結誤差（[03](03_linking.html) 第 4 節）：兩個世代的題目參數不是一起估的。
+
+### 4.7 什麼時候不行
+
+一個分量表只在某些波次有題，而且沒有任何題接到其他波次時（例如只在 84 個月以後才有的分量表），沒有東西把它放到前面的量尺上。
+硬要對照，只能假設它和別的分量表量相近的能力；那是「對應」（concordance），不是等化。
+對應要求兩個測驗量相近的能力、信度和難度也相近（Kolen & Brennan, 2014, §10.1, pp. 496-497）；量的能力不同時，連對應都不算。
+這種分量表只在它有題的波次之間比較；[07](07_subscales.html) 第 4.2 節用模擬看外插會錯多少。
+
+## 5 垂直量尺：`kits_vertical()`
+
+### 5.1 做什麼用
+
+KIT 的波次是垂直量尺的各個層級。
+所有世代換到同一條量尺以後，每個世代 × 波次看三件事（Kolen & Brennan, 2014, pp. 461-469）：
+
+* 成長：和前一波的平均差 `growth`。
+* 分散：扣掉測量誤差的 SD `sd_true`。
+* 分開多少：效果量 `effect_size`，和「這一波的孩子高過前一波孩子」的機率 `p_sup`。
+
+兩個世代都有的波次，`attr(, "cohorts")` 比較兩個世代的平均和 SD。
+
+### 5.2 公式
+
+$$
+\mathit{sd\_true} = \sqrt{\max\big(\mathrm{SD}^2 - \overline{\mathit{se}^2},\ 0\big)},\quad
+\text{effect size} = \frac{\bar{y}_w - \bar{y}_{w-1}}{\sqrt{(\mathrm{SD}_w^2 + \mathrm{SD}_{w-1}^2)/2}},\quad
+p_{\mathrm{sup}} = P(Y_w > Y_{w-1}) + \tfrac12 P(Y_w = Y_{w-1})
+$$
+
+```latex
+\mathit{sd\_true} = \sqrt{\max\big(\mathrm{SD}^2 - \overline{\mathit{se}^2},\ 0\big)},\quad
+\text{effect size} = \frac{\bar{y}_w - \bar{y}_{w-1}}{\sqrt{(\mathrm{SD}_w^2 + \mathrm{SD}_{w-1}^2)/2}},\quad
+p_{\mathrm{sup}} = P(Y_w > Y_{w-1}) + \tfrac12 P(Y_w = Y_{w-1})
+```
+
+兩個世代在同一個波次：
+
+$$
+z = \frac{\bar{y}_2 - \bar{y}_1}{\sqrt{\mathrm{SD}_1^2/n_1 + \mathrm{SD}_2^2/n_2 + \mathrm{SE}_{\mathrm{link},1}^2 + \mathrm{SE}_{\mathrm{link},2}^2}},\quad
+z_{\mathrm{link}} = \frac{\bar{y}_2 - \bar{y}_1}{\sqrt{\mathrm{SE}_{\mathrm{link},1}^2 + \mathrm{SE}_{\mathrm{link},2}^2}}
+$$
+
+```latex
+z = \frac{\bar{y}_2 - \bar{y}_1}{\sqrt{\mathrm{SD}_1^2/n_1 + \mathrm{SD}_2^2/n_2 + \mathrm{SE}_{\mathrm{link},1}^2 + \mathrm{SE}_{\mathrm{link},2}^2}},\quad
+z_{\mathrm{link}} = \frac{\bar{y}_2 - \bar{y}_1}{\sqrt{\mathrm{SE}_{\mathrm{link},1}^2 + \mathrm{SE}_{\mathrm{link},2}^2}}
+```
+
+* 效果量用兩個變異數的未加權平均（Eq. 9.47；Yen, 1986）。
+* `p_sup` 只看順序，所以量尺做單調轉換也不變（p. 469）。
+* 年紀越大 `sd_true` 越小，叫做量尺縮小（p. 468）；先檢查測量誤差和連結，再解讀成孩子的差異變小。
+* $\mathrm{SE}_{\mathrm{link}}$ 是平均的連結誤差；沒換算過的世代當成 0。
+
+### 5.3 用 kits
+
+M36 換到 M03 的量尺，和 M03 疊起來：
+
+```{r}
+both <- rbind(s03, kits_convert(s36, co))
+vert <- kits_vertical(both)
+vert
+```
+
+模擬時每一波的真正 SD 都是 0.9，所以 `sd_true` 的變化是測量造成的：題本短，每個孩子的 `se` 和 SD 差不多大。
+
+### 5.4 手算
+
+扣掉測量誤差的 SD，和 `p_sup`（兩波所有孩子的配對）：
+
+```{r}
+true_sd <- function(y, se) sqrt(max(var(y) - mean(se^2), 0))
+p_superior <- function(y, y_prev) {
+  if (is.null(y_prev)) return(NA_real_)
+  o <- outer(y, y_prev, "-")
+  mean(o > 0) + 0.5 * mean(o == 0)
+}
+```
+
+每個世代 × 波次，再和同一世代的前一波比：
+
+```{r}
+my <- as_tibble(both) |>
+  summarise(mean = mean(theta), sd = sd(theta), sd_true = true_sd(theta, se), y = list(theta),
+            .by = c(cohort, wave_m)) |>
+  mutate(growth = mean - lag(mean), effect_size = growth / sqrt((sd^2 + lag(sd)^2) / 2),
+         p_sup = map2_dbl(y, lag(y), p_superior), .by = cohort)
+cols <- c("mean", "sd", "sd_true", "growth", "effect_size", "p_sup")
+map_lgl(set_names(cols), \(v) same(my[[v]], vert[[v]]))
+```
+
+平均的連結誤差：每個孩子的 $\mathrm{SE}_{\mathrm{link}}^2$ 是 $\theta$ 的二次式，所以在平均讀就是平均的連結誤差。
+二次式的係數是連結的重抽（`co$vcov`）：
+
+```{r}
+se_link_at <- function(t) sqrt(co$vcov[1, 1] + t^2 * co$vcov[2, 2] + 2 * t * co$vcov[1, 2])
+mean36 <- summarise(as_tibble(s36), theta = mean(theta), .by = wave_m)
+same(se_link_at(mean36$theta), filter(vert, cohort == "M36")$se_link)
+```
+
+36 個月兩個世代的比較：
+
+```{r}
+at36 <- filter(my, wave_m == 36)
+n36 <- count(as_tibble(both), cohort, wave_m) |> filter(wave_m == 36)
+d36 <- diff(at36$mean)
+se_l <- se_link_at(mean36$theta[mean36$wave_m == 36])
+z_hand <- c(z = d36 / sqrt(sum(at36$sd^2 / n36$n) + se_l^2), z_link = d36 / se_l)
+same(z_hand, unlist(attr(vert, "cohorts")[c("z", "z_link")]))
+```
+
+兩個世代在 36 個月差 `r round(d36, 2)` logit，$z$ 約 `r round(z_hand[["z"]], 1)`：在誤差以內。
+
+## 6 連結檢查：`kits_link_check()`
+
+### 6.1 做什麼用
+
+世代連結（[03](03_linking.html)）靠共同題。
+共同題本身有問題時，連結也會偏。
+`kits_link_check()` 用兩個不靠「篩過的共同題」的算法，各畫一條線，和連結比：
+
+1. 同齡組：兩個世代都有的波次，假設同齡的孩子能力分布相同。
+   每個世代在這一波估一個常態 $N(\mu_w, \sigma_w^2)$（邊際最大概似，題目參數固定；[模型教學](../tutorial_models/kits_models.html) 第 7 節）。
+2. 同時校準：兩個世代的資料疊起來一起做 CML，再看兩個分開的校準怎麼對到它。
+
+### 6.2 公式
+
+$$
+A = \sqrt{\frac{\overline{\sigma^2_{\mathit{to}}}}{\overline{\sigma^2_{\mathit{from}}}}},\quad
+B = \overline{\mu}_{\mathit{to}} - A\,\overline{\mu}_{\mathit{from}};\qquad
+A = A_f / A_t,\quad B = (B_f - B_t) / A_t;\qquad
+\mathrm{diff}(\theta) = (B_m + A_m\theta) - (B + A\theta),\quad
+z = \mathrm{diff}(\theta)/\mathrm{SE}_{\mathrm{link}}(\theta)
+$$
+
+```latex
+A = \sqrt{\frac{\overline{\sigma^2_{\mathit{to}}}}{\overline{\sigma^2_{\mathit{from}}}}},\quad
+B = \overline{\mu}_{\mathit{to}} - A\,\overline{\mu}_{\mathit{from}};\qquad
+A = A_f / A_t,\quad B = (B_f - B_t) / A_t;\qquad
+\mathrm{diff}(\theta) = (B_m + A_m\theta) - (B + A\theta),\quad
+z = \mathrm{diff}(\theta)/\mathrm{SE}_{\mathrm{link}}(\theta)
+```
+
+* 第一段：同齡組，平均是所有共同波次的平均。
+* 第二段：同時校準；$\mathit{thr}_{\mathrm{conc}} = B_f + A_f\,\mathit{thr}_{\mathrm{from}} = B_t + A_t\,\mathit{thr}_{\mathrm{to}}$（每個校準所有門檻的 mean/sigma）。
+* 第三段：$B_m$、$A_m$ 是一個檢查的線，$B$、$A$ 是連結；$|z| > 2$ 時註記。
+  `z_both` 的分母再加上檢查方法自己的抽樣誤差 `se_method`。
+
+### 6.3 用 kits
+
+```{r}
+chk <- kits_link_check(co, item36, item03, X36, X03, persons = persons)
+chk$methods[c("method", "intercept", "slope")]
+```
+
+`chk$waves$converged` 是 `nlminb()` 的代碼；之後的牛頓步才走到最大值（[模型教學](../tutorial_models/kits_models.html) 第 3、7 節），所以診斷的 convergence 警告要對照那裡讀。
+
+### 6.4 手算
+
+同齡組的線，從每個世代在 36 個月的 $\mu$、$\sigma$：
+
+```{r}
+wv <- chk$waves
+A_age <- sqrt(mean(wv$sd_to^2) / mean(wv$sd_from^2))
+B_age <- mean(wv$mean_to) - A_age * mean(wv$mean_from)
+same(c(B_age, A_age), unlist(chk$methods[2, c("intercept", "slope")]))
+```
+
+同時校準的線，從兩條對到同時校準的線（`chk$lines`）：
+
+```{r}
+ln <- chk$lines
+A_conc <- ln$slope[1] / ln$slope[2]
+B_conc <- (ln$intercept[1] - ln$intercept[2]) / ln$slope[2]
+same(c(B_conc, A_conc), unlist(chk$methods[3, c("intercept", "slope")]))
+```
+
+在 M36 每一波的中位數 $\theta$，檢查的線和連結差多少，以連結誤差為單位：
+
+```{r}
+at <- as.data.frame(chk$at) |>
+  filter(method != "common items (the link)")
+B_m <- ifelse(at$method == "concurrent CML", B_conc, B_age)
+A_m <- ifelse(at$method == "concurrent CML", A_conc, A_age)
+diff_hand <- (B_m + A_m * at$theta) - (co$intercept + co$slope * at$theta)
+c(diff = same(diff_hand, at$diff), z = same(diff_hand / se_link_at(at$theta), at$z))
+```
+
+```{r}
+select(at, theta, method, diff, z, z_both)
+```
+
+$|z|$ 都小於 2：兩種獨立的算法和共同題的連結一致。
+
+## 7 和 kitsPreview（dexter、cNORM）比
+
+kitsPreview 是舊版的 kits：它不自己寫模型，而是呼叫 dexter（CML、WLE、DIF）和 cNORM（常模）。
+兩個套件有同名的函數和類別（例如 `kits_item`），一起載入時 S3 方法會互相蓋掉。
+所以 kitsPreview 在另一個 R 程序裡執行（`callr::r()`），只把數字帶回來。
+
+這一節要比的 kits 結果：門檻、WLE、世代連結（同樣的 `n_boot` 和種子）、性別 DIF、常模的 P50。
+
+```{r}
+sex <- setNames(persons$sex, persons$visit_id)
+dif03 <- kits_dif(X03, sex)
+ages <- seq(12, 48, by = 2)
+norm <- kits_norms(both$theta, both$age_m, ages, degrees = c(3, 2, 2, 1), pad = 0)
+```
+
+dexter 的 `DIF()` 要長格式，帶著性別；它的人次欄叫 `person_id`：
+
+```{r}
+long03_sex <- as_tibble(X03, rownames = "person_id") |>
+  pivot_longer(-person_id, names_to = "item_id", values_to = "item_score",
+               values_drop_na = TRUE) |>
+  mutate(sex = unname(sex[person_id])) |>
+  as.data.frame()
+```
+
+在另一個程序裡執行的函數只用 `::`，不 `library()` 任何套件：
+
+```{r}
+preview_cml <- function(X03, X36) {
+  i03 <- kitsPreview::kits_item(X03)
+  co <- kitsPreview::kits_linking(kitsPreview::kits_item(X36), i03, n_boot = 200)
+  list(thr = coef(i03)$thr, theta = as.data.frame(kitsPreview::kits_subj(X03, i03))$theta,
+       line = c(co$intercept, co$slope, co$intercept_error, co$slope_error))
+}
+```
+
+```{r}
+preview_dif_norm <- function(X03, sex03, long03_sex, D, age_m, ages) {
+  dx <- dexter::DIF(long03_sex, person_property = "sex")
+  nm <- kitsPreview::kits_norms(D, age_m, ages, degrees = c(3, 2, 2, 1), pad = 0)
+  list(dif = kitsPreview::kits_dif(X03, sex03)$dif, overall = unlist(dx$DIF_overall),
+       P50 = nm$P50, version = as.character(packageVersion("kitsPreview")))
+}
+```
+
+兩個函數和它們的引數一起交給另一個程序：
+
+```{r}
+preview_args <- list(X03 = X03, X36 = X36, sex03 = unname(sex[rownames(X03)]),
+                     long03_sex = long03_sex, D = both$theta, age_m = both$age_m, ages = ages)
+both_jobs <- function(f1, f2, a) {
+  c(f1(a$X03, a$X36), f2(a$X03, a$sex03, a$long03_sex, a$D, a$age_m, a$ages))
+}
+preview <- callr::r(both_jobs,
+                    args = list(f1 = preview_cml, f2 = preview_dif_norm, a = preview_args))
+preview$version
+kits_line <- c(co$intercept, co$slope, co$intercept_error, co$slope_error)
+```
+
+兩邊的差距：
+
+```{r}
+cmp <- c(thr = max(abs(preview$thr - coef(item03)$thr)),
+         theta = max(abs(preview$theta - s03$theta)),
+         link = max(abs(preview$line - kits_line)),
+         dif = max(abs(preview$dif - dif03$dif)),
+         dexter_overall = max(abs(preview$overall - unlist(attr(dif03, "overall")))),
+         norm_P50 = max(abs(preview$P50 - norm$P50)))
+signif(cmp, 2)
+all(cmp < 1e-6)
+```
+
+* `thr`、`theta`：dexter 的 `fit_enorm()`、`ability()`；`dexter_overall`：dexter 的 `DIF()`；`norm_P50`：cNORM 的 `cnorm.shash()`。
+
+* 門檻和 $\theta$：kits 的 CML、WLE 和 dexter 走到同一個最大值，只差浮點誤差。
+* 連結：兩邊都是同一個封閉解，同樣的種子和 `n_boot`。
+* DIF：同一個方法；所有的題都比時，kits 的置中 $C$ 不改變任何東西，所以 dexter 的整體檢定也相同（[05](05_checks.html) 第 4.4 節）。
+* 常模：同樣的模型和設定；梯度不同（RTMB 對數值微分），兩邊各停在自己的容許誤差。
+* 第 3–6 節的方法 kitsPreview 沒有，所以只和手算比。
+
+## 8 可以重做的流程
+
+下面的區塊貼到只有 `library(kits)` 的新 R 就能重做；這份文件也在新的 R 裡執行它們，和這裡的結果比。
+
+### 8.1 精準度和原始分對照
+
+```{r pipe-prec}
+betas_p <- lapply(seq(-3, 3, length.out = 12), function(b) b + c(-0.5, 0.5))
+names(betas_p) <- sprintf("a%02d", 1:12)
+set.seed(11)
+X_p <- kits_sim(rnorm(800, 0, 1.5), betas_p, seed = 1)
+item_p <- kits_item(X_p, scale = "a")
+prec_p <- kits_precision(item_p, list(easy = sprintf("a%02d", 1:8), hard = sprintf("a%02d", 5:12)))
+```
+
+12 題裡的 a01–a08 拿幾分，等於 a05–a12 的幾分：
+
+```{r pipe-raw}
+tab_p <- kits_subj_table(subset(coef(item_p), item_id %in% sprintf("a%02d", 1:8)))
+equivalent_p <- kits_expected_score(item_p, items = sprintf("a%02d", 5:12))(tab_p$theta)
+table_p <- data.frame(raw = tab_p$raw, equivalent = round(equivalent_p, 2))
+list(ranges = attr(prec_p, "ranges"), equivalent = table_p)
+```
+
+```{r}
+fresh_p <- run_fresh(c("pipe-prec", "pipe-raw"))
+identical(fresh_p, list(ranges = attr(prec_p, "ranges"), equivalent = table_p))
+```
+
+能力用 `rnorm()` 抽，所以區塊裡先 `set.seed()`；`kits_sim(seed = )` 只管作答的亂數。
+
+### 8.2 兩個世代的垂直量尺
+
+```{r pipe-v1}
+betas_v <- lapply(seq(-3, 3, length.out = 10), function(b) b + c(-0.5, 0.5))
+names(betas_v) <- paste0("a", 1:10)
+set.seed(1)
+wave <- rep(c(24, 36, 36, 48), each = 400)
+theta_v <- 2 * log(wave / 24) + rnorm(1600)
+young <- kits_sim(theta_v[1:800], betas_v[1:7], prefix = "y", seed = 1)
+old <- kits_sim(theta_v[801:1600], betas_v[4:10], prefix = "o", seed = 2)
+```
+
+```{r pipe-v2}
+persons_v <- data.frame(visit_id = c(rownames(young), rownames(old)), wave_m = wave,
+                        cohort = rep(c("young", "old"), each = 800))
+item_y <- kits_item(young, scale = "young")
+item_o <- kits_item(old, scale = "old")
+link_v <- kits_linking(item_o, item_y, n_boot = 100)
+```
+
+```{r pipe-v3}
+s_v <- rbind(kits_subj(young, item_y, persons = persons_v),
+             kits_convert(kits_subj(old, item_o, persons = persons_v), link_v))
+vert_v <- kits_vertical(s_v)
+list(vertical = as.data.frame(vert_v), cohorts = as.data.frame(attr(vert_v, "cohorts")))
+```
+
+```{r}
+fresh_v <- run_fresh(c("pipe-v1", "pipe-v2", "pipe-v3"))
+local_v <- list(vertical = as.data.frame(vert_v), cohorts = as.data.frame(attr(vert_v, "cohorts")))
+identical(fresh_v, local_v)
+```
+
+## 9 接下來
+
+下一份：[07 分量表](07_subscales.html)，跨波次的分量表分數、它的 SE、成長模型，和用模擬檢查它對不對。
+
+* 從頭讀起：[01 校準](01_calibration.html)、[02 計分](02_scoring.html)、[03 連結](03_linking.html)、[04 常模](04_norms.html)、[05 檢查](05_checks.html)。
+* 每個模型在 RTMB 裡怎麼寫：[kits 的模型](../tutorial_models/kits_models.html)。
+
+全部算完的時間：
+
+```{r}
+round(difftime(Sys.time(), t_start, units = "secs"))
+```
+
+## 參考文獻
+
+* Kolen, M. J., & Brennan, R. L. (2014). *Test equating, scaling, and linking* (3rd ed.). Springer. doi:10.1007/978-1-4939-0317-7
+* Lenhard, A., Lenhard, W., & Gary, S. (2018). Continuous norming (cNORM). The Comprehensive R Archive Network.
+* Lord, F. M., & Wingersky, M. S. (1984). Comparison of IRT true-score and equipercentile observed-score "equatings". *Applied Psychological Measurement, 8*(4), 453-461. doi:10.1177/014662168400800409
+* Maris, G., Bechger, T., Koops, J., & Partchev, I. (2026). dexter: Data management and analysis of tests (R package version 1.8.1).
+* Masters, G. N. (1982). A Rasch model for partial credit scoring. *Psychometrika, 47*(2), 149-174. doi:10.1007/BF02296272
+* Thissen, D., Pommerich, M., Billeaud, K., & Williams, V. S. L. (1995). Item response theory for scores on tests including polytomous items with ordered responses. *Applied Psychological Measurement, 19*(1), 39-49. doi:10.1177/014662169501900105
+* Warm, T. A. (1989). Weighted likelihood estimation of ability in item response theory. *Psychometrika, 54*(3), 427-450. doi:10.1007/BF02294627
+* Yen, W. M. (1986). The choice of scale for educational measurement: An IRT perspective. *Journal of Educational Measurement, 23*(4), 299-325. doi:10.1111/j.1745-3984.1986.tb00252.x

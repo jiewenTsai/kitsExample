@@ -1,0 +1,544 @@
+---
+title: "已知真值下的四種估法：KIT 語言量尺的模擬"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    grid:
+      body-width: 1100px
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 5.5, dpi = 110)
+options(width = 100)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+```
+
+讀進模擬的結果（`R/sim_kit.R`）和真實模型（`R/truth.R`）。
+
+```{r}
+RES_FILE <- Sys.getenv("SIM_RES", "results/sim_kit_100reps.rds")
+res <- readRDS(RES_FILE)
+truth <- readRDS("results/truth.rds")
+summ <- set_names(res$SUMMARISE, res$scenario)
+reps <- res$REPLICATIONS[1]
+```
+
+每一種結果是一個表，五個情境接在一起：
+
+```{r}
+part <- function(name) {
+  summ |>
+    map(name) |>
+    list_rbind(names_to = "scenario")
+}
+```
+
+數字的格式，和圖的顏色：
+
+```{r}
+f2 <- function(x) formatC(x, digits = 2, format = "f")
+f3 <- function(x) formatC(x, digits = 3, format = "f")
+pct <- function(x) paste0(formatC(100 * x, digits = 1, format = "f"), "%")
+COLS <- c("#0072B2", "#D55E00", "#7F7F7F", "#000000")
+```
+
+四種估法的線：顏色之外，也用線型和點的形狀分開。
+
+```{r}
+method_look <- list(
+  scale_colour_manual(values = COLS, name = NULL),
+  scale_linetype_manual(values = c("solid", "solid", "dashed", "dotted"), name = NULL),
+  scale_shape_manual(values = c(16, 17, 15, 4), name = NULL),
+  theme_bw(),
+  theme(legend.position = "top")
+)
+```
+
+估法的名字：
+
+```{r}
+CALIBS <- c(CML = "CML", MML1 = "MML 一個常態", MMLw = "MML 每波一個常態")
+METHODS <- c("1 CML + WLE", "2 MML 一個常態 + WLE", "3 MML 每波常態 + WLE",
+             "4 MML 每波常態 + EAP")
+SCEN <- c("A", "B1", "B2", "C", "D")
+```
+
+
+# 1 目的
+
+這一節回答：為什麼要模擬，理論預期什麼。
+
+真實資料上，kits（CML + WLE）和 TAM 的數字不一樣。
+沒有真值，就不知道誰對。
+模擬時真值是我們給的。
+所以可以直接問：哪一種估法找回真值？
+差距大不大？
+比較一路做到兩個世代的內部連結為止。
+接到 D 的外部連結不在這裡：它只是再一次線性轉換。
+
+理論的預期：
+
+* CML 以原始分為條件，能力分佈從概似裡消掉；只要資料是 PCM，不論能力怎麼分佈，題目參數都一致（Andersen, 1970）。
+* MML 把能力積分掉；只有假設的分佈對了，題目參數才一致。
+* WLE 去掉 MLE 的一階偏誤（Warm, 1989）。
+  kits 算的是 Jeffreys 眾數估計；對 PCM，它和 WLE 相同（Firth, 1993; Magis, 2015）。
+* EAP 往事前分佈的平均縮。
+
+四種估法，同一份模擬資料都跑一次，所以是成對的比較：
+
+1. CML + WLE：`kits::kits_item()`、`kits::kits_subj()`。
+2. MML 一個常態 + WLE：`TAM::tam.mml(irtmodel = "PCM")`、`TAM::tam.wle()`。
+3. MML 每個波次一個常態 + WLE：`tam.mml(..., group = wave)`、`tam.wle()`。
+4. MML 每個波次一個常態 + EAP：和 3 同一個校準，用 `$person$EAP`、`SD.EAP`。
+
+3 和 4 是同一個校準，所以題目參數和連結只有三組（CML、MML 一個常態、MML 每波一個常態）。
+
+
+# 2 真實模型和情境
+
+這一節回答：真值怎麼來，五個情境差在哪裡。
+
+## 2.1 真實模型
+
+真實模型全部從 kits 的示範資料（`kitm03`、`kitm36`）的語言領域建出來（`R/truth.R`）。
+
+```{r}
+betas <- truth$betas
+n_items <- betas |>
+  summarise(items = n_distinct(item_id), steps = n(), .by = source)
+link_demo <- truth$link_demo
+cors <- truth$cors
+```
+
+* 題目參數：kits 分別校準示範資料的 M03、M36；`kits_linking()` 把 M36 接到 M03（斜率 `r f3(link_demo[["slope"]])`）。
+* 只留平移，斜率固定 1：平移是篩選後留下的 `r link_demo[["n"]] - link_demo[["dropped"]]` 個點的 `mean(to - from)`，等於 `r f3(truth$shift)`。
+* 所以真值是一個 PCM，在 M03 的量尺上。
+* M03 有的 `r n_items$items[n_items$source == "M03"]` 題（含 `r length(truth$common)` 題共同題）用 M03 的值。
+* 只有 M36 有的 `r n_items$items[n_items$source == "M36"]` 題用 M36 的值加平移。
+* 每題 3 步，共 `r sum(n_items$steps)` 個步驟參數。
+
+每個波次的平均、真分數 SD（M03 的量尺），和到訪的比例：
+
+```{r}
+truth$waves |>
+  select(cohort, wave_m, mean, sd, p_wave) |>
+  knitr::kable(digits = 2)
+```
+
+* 平均和 SD：題目參數固定在 kits 的值，TAM 每個波次估一個常態（M36 再加平移）。
+* 古典的修正 `var(WLE) - mean(SE^2)` 在 3、6 個月是負的（6 題、很多 0 分），所以不用它。
+* 每個孩子在每個波次出現的機率照示範資料；每波答自己的標準題本（最常見的作答組合），每題沒作答的比例也照示範資料。
+* 每個世代 `r truth$N_CHILDREN` 個孩子。
+
+相鄰波次的相關：示範資料 WLE 的相關，除以信度乘積的平方根（修正誤差），最多 0.95。
+
+```{r}
+cors |>
+  select(cohort, w1, w2, r_obs, r) |>
+  knitr::kable(digits = 2)
+```
+
+* 修正後的相關在 `r f2(min(cors$r))` 到 `r f2(max(cors$r))` 之間。
+* 不相鄰的波次是中間相鄰相關的乘積（一階馬可夫）。
+
+## 2.2 情境
+
+```{r}
+scen_tab <- tibble::tribble(
+  ~情境, ~每個波次的能力分佈,                                ~反應模型,
+  "A",   "常態（最有利於估法 3）",                           "PCM",
+  "B1",  "左偏：反轉的標準化 gamma（shape 4，偏態 -1）",     "PCM",
+  "B2",  "混合：90% 常態 + 10% 遲緩（每波都低 2 SD）",       "PCM",
+  "C",   "常態，SD 放大 2 倍（平均不變）：地板和天花板",      "PCM",
+  "D",   "常態",                                             "GPCM，斜率 lognormal(0, 0.3)"
+)
+```
+
+```{r}
+knitr::kable(scen_tab)
+```
+
+* B1、B2 的平均和 SD 和 A 一樣（先標準化）。
+* B1、B2 經過常態的 copula，孩子在波次之間的相關結構不變；B2 的「遲緩」是孩子的特質，每個波次都在。
+* C 原本想用 1.6 倍；試算時 1.6 倍的地板、天花板只比 A 多一點，所以用 2 倍。
+* D 的斜率每次複製重抽一次，同一題在兩個世代相同；估的時候照常配 PCM。
+
+每個波次 0 分（地板）和滿分（天花板）的比例，A 和 C 比：
+
+```{r}
+floors <- part("floor") |>
+  filter(scenario %in% c("A", "C")) |>
+  pivot_wider(id_cols = c(cohort, wave_m), names_from = scenario,
+              values_from = c(floor, ceiling))
+knitr::kable(floors, digits = 3)
+```
+
+```{r}
+fl <- part("floor")
+fl_A <- filter(fl, scenario == "A")
+fl_C <- filter(fl, scenario == "C")
+```
+
+* A：3 個月 0 分的有 `r pct(fl_A$floor[fl_A$cohort == "M03" & fl_A$wave_m == 3])`，M03 的 72 個月滿分的有 `r pct(fl_A$ceiling[fl_A$cohort == "M03" & fl_A$wave_m == 72])`。
+* C：同樣的兩個數字是 `r pct(fl_C$floor[fl_C$cohort == "M03" & fl_C$wave_m == 3])` 和 `r pct(fl_C$ceiling[fl_C$cohort == "M03" & fl_C$wave_m == 72])`。
+* C 的地板、天花板延伸到更多波次：0 分超過 1% 的波次有 `r sum(fl_C$floor > 0.01)` 個（A 是 `r sum(fl_A$floor > 0.01)` 個），滿分超過 5% 的有 `r sum(fl_C$ceiling > 0.05)` 個（A 是 `r sum(fl_A$ceiling > 0.05)` 個）。
+* 地板和天花板來自同一個機制（SD 變寬），所以放在同一個情境。
+
+## 2.3 每次複製怎麼做
+
+1. 模擬兩個世代。
+2. 每種估法分開校準 M03 和 M36。
+3. 連結 M36 → M03，每種估法同一套程序：共同題每一步的 Thurstonian 門檻當點，`kits_link_screen()`（殘差超過 2 SD 的點丟掉），再 `kits_link_line()`（mean/sigma）。
+4. 原點：每種估法的 M03 量尺平移一次，讓 M03 步驟參數的平均等於真值的平均。
+5. M36 先置中（步驟參數平均 0），之後只靠連結放到 M03；不直接對齊真值。
+
+M36 不對齊真值，正是這個研究要看的：連結有沒有把 M36 放對。
+
+有一個細節：CML 只用不是 0 分、也不是滿分的人次。
+這些人次裡，一題的分數要從 0 到 3 都有人，步驟參數才估得出來。
+不合的題在那一次、那個世代不放進校準（四種估法都一樣）。
+
+```{r}
+dropped <- part("dropped") |>
+  mutate(share = reps_dropped / reps)
+knitr::kable(dropped, digits = 2)
+```
+
+```{r}
+lanc01 <- dropped |>
+  filter(cohort == "M36", item_id == "lanc01")
+```
+
+* 最常拿掉的是共同題 lanc01：用 M03 的值時，它對 M36 太容易，M36 幾乎沒有人得 0、1 分。
+* 它在 M36 被拿掉的比例：`r paste(lanc01$scenario, pct(lanc01$share), sep = " ", collapse = "、")`。
+* 所以 M36 的連結通常用 `r length(truth$common) - 1` 題共同題。
+
+## 2.4 執行
+
+```{r}
+run <- part("run")
+conv <- part("conv")
+not_conv <- sum(conv$not_converged, na.rm = TRUE)
+max_iter <- max(conv$max_iter, na.rm = TRUE)
+minutes <- attr(res, "run_minutes")
+settings <- attr(res, "settings")
+```
+
+```{r}
+w03 <- filter(truth$waves, cohort == "M03")
+reach72 <- w03$mean[w03$wave_m == 72] - w03$mean[w03$wave_m == 3]
+reach72_C <- reach72 + 3 * 2 * w03$sd[w03$wave_m == 72]
+```
+
+* 每個情境 `r reps` 次複製，5 個情境，`r settings$ncores` 個核心平行，共 `r round(minutes)` 分鐘。
+* TAM 的設定照比較教學（第 2.1、2.4 節）：`acceleration = "Ramsay"`，`maxiter = `r settings$maxiter``。
+* 積分點從 `r settings$nodes[1]` 到 `r settings$nodes[2]`，間距 0.3（`r settings$n_nodes` 點）。
+* 每個波次一個常態時，TAM 把 3 個月的平均定成 0；72 個月的平均在 +`r f2(reach72)`，C 的上尾（+3 SD）到 +`r f2(reach72_C)`。
+* TAM 一共 `r sum(conv$fits[conv$calib != "CML"])` 次校準，沒有收斂（到達迭代上限）的有 `r not_conv` 次；最多用了 `r max_iter` 次迭代。
+* kits 的 CML 沒有收斂的有 `r sum(conv$not_converged[conv$calib == "CML"])` 次。
+* 另外有 `r sum(res$ERRORS, na.rm = TRUE)` 次 TAM 停在錯誤上（情境 `r res$scenario[which(res$ERRORS > 0)]`）：重跑那個種子，是估法 2（一個常態）的 M03 校準，Ramsay 加速時變異數變成 NaN。
+* SimDesign 把那一次丟掉、重抽一份資料，所以每個情境仍是 `r reps` 次。
+
+迭代次數（平均、最多），和每次複製兩個世代合起來的秒數：
+
+```{r}
+conv |>
+  filter(calib != "CML") |>
+  pivot_wider(id_cols = c(calib, cohort), names_from = scenario, values_from = mean_iter) |>
+  knitr::kable(digits = 0)
+```
+
+```{r}
+run |>
+  pivot_wider(id_cols = calib, names_from = scenario, values_from = seconds) |>
+  mutate(calib = CALIBS[calib]) |>
+  knitr::kable(digits = 1)
+```
+
+* 每個波次一個常態最慢：每次複製約 `r round(mean(run$seconds[run$calib == "MMLw"]))` 秒，CML 約 `r round(mean(run$seconds[run$calib == "CML"]), 1)` 秒。
+* 估法 4 和 3 是同一個校準，不另外花時間。
+
+
+# 3 題目參數
+
+這一節回答：對齊（M03）或連結（M36）以後，步驟參數離真值多遠？
+
+```{r}
+items <- part("items") |>
+  mutate(calib = factor(CALIBS[calib], CALIBS))
+item_tab <- items |>
+  select(scenario, cohort, calib, mean_bias, mean_abs_bias, mean_rmse) |>
+  arrange(cohort, scenario, calib)
+```
+
+`mean_bias` 是各步驟偏誤的平均，`mean_abs_bias` 是各步驟偏誤絕對值的平均，`mean_rmse` 是各步驟 RMSE 的平均。
+
+```{r}
+knitr::kable(item_tab, digits = 3)
+```
+
+```{r}
+ib <- function(sc, coh, cal, col = "mean_abs_bias") {
+  items[[col]][items$scenario == sc & items$cohort == coh & items$calib == CALIBS[[cal]]]
+}
+```
+
+每一步的偏誤，對真值畫（M03）：
+
+```{r}
+steps03 <- part("steps") |>
+  filter(cohort == "M03") |>
+  mutate(calib = factor(CALIBS[calib], CALIBS))
+```
+
+```{r, fig.height = 4.5}
+ggplot(steps03, aes(true, bias, colour = calib, shape = calib)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_point(size = 1.8, alpha = 0.8) +
+  facet_wrap(~scenario, nrow = 1) +
+  method_look[c(1, 3:5)] +
+  labs(x = "真的步驟參數（M03 量尺）", y = "偏誤")
+```
+
+* M03 的步驟參數平均偏誤都是 0：這是對齊的規則（平均等於真值的平均），不是結果。
+* 要看的是每一步的偏誤絕對值。
+* A：CML `r f3(ib("A", "M03", "CML"))`，MML 每波一個常態 `r f3(ib("A", "M03", "MMLw"))`，MML 一個常態 `r f3(ib("A", "M03", "MML1"))`。
+* CML 和每波一個常態的 RMSE 幾乎相同（`r f3(ib("A", "M03", "CML", "mean_rmse"))`、`r f3(ib("A", "M03", "MMLw", "mean_rmse"))`）：差異只是抽樣誤差。
+* 一個常態的偏誤有方向：容易的步驟估高、難的步驟估低（圖），量尺被壓擠，和比較教學第 3 節真實資料看到的一樣。
+* M36（連結後）：一個常態的步驟參數平均偏 `r f3(ib("A", "M36", "MML1", "mean_bias"))`，整條量尺往下移；CML 是 `r f3(ib("A", "M36", "CML", "mean_bias"))`。
+* B1（左偏）：每波一個常態開始偏離，M03 是 `r f3(ib("B1", "M03", "MMLw"))`（CML `r f3(ib("B1", "M03", "CML"))`），M36 是 `r f3(ib("B1", "M36", "MMLw"))`（CML `r f3(ib("B1", "M36", "CML"))`）。
+* B2（混合）的偏離小一些：M03 `r f3(ib("B2", "M03", "MMLw"))`，CML `r f3(ib("B2", "M03", "CML"))`。
+* C（SD × 2）：CML 和每波一個常態一樣好（M03 `r f3(ib("C", "M03", "CML"))`、`r f3(ib("C", "M03", "MMLw"))`）；地板和天花板不影響題目參數。
+* D（資料是 GPCM）：三種校準都偏，CML `r f3(ib("D", "M03", "CML"))`、每波一個常態 `r f3(ib("D", "M03", "MMLw"))`。
+* CML 不需要能力分佈的假設，但仍然需要 PCM；模型錯時它沒有比較好。
+
+
+# 4 內部連結
+
+這一節回答：M36 → M03 的直線，截距和斜率對不對？
+
+真的截距是置中的 M36 量尺換到 M03 的平移（真的 M36 步驟參數的平均），真的斜率是 1。
+
+```{r}
+link <- part("link") |>
+  mutate(calib = factor(CALIBS[calib], CALIBS))
+link |>
+  select(scenario, calib, intercept_bias, intercept_rmse, slope_bias, slope_rmse, mean_dropped) |>
+  knitr::kable(digits = 3)
+```
+
+```{r}
+lk <- function(sc, cal, col = "intercept_bias") {
+  link[[col]][link$scenario == sc & link$calib == CALIBS[[cal]]]
+}
+```
+
+* A：截距的偏誤，CML `r f3(lk("A", "CML"))`，每波一個常態 `r f3(lk("A", "MMLw"))`，一個常態 `r f3(lk("A", "MML1"))`。
+* 一個常態的截距偏誤是 CML 的 RMSE（`r f3(lk("A", "CML", "intercept_rmse"))`）的 `r round(abs(lk("A", "MML1")) / lk("A", "CML", "intercept_rmse"))` 倍：這不是抽樣誤差。
+* 原因：一個常態把兩個世代各自壓擠，共同題的門檻在 M03 和 M36 被壓擠的方式不同（它們在 M03 是難題，在 M36 是容易的題）。
+* 斜率的偏誤都小：A 的三種校準在 `r f3(min(link$slope_bias[link$scenario == "A"]))` 到 `r f3(max(link$slope_bias[link$scenario == "A"]))` 之間。
+* B1：每波一個常態的截距偏 `r f3(lk("B1", "MMLw"))`、斜率偏 `r f3(lk("B1", "MMLw", "slope_bias"))`；CML 是 `r f3(lk("B1", "CML"))`、`r f3(lk("B1", "CML", "slope_bias"))`。
+* C：CML 和每波一個常態都準（`r f3(lk("C", "CML"))`、`r f3(lk("C", "MMLw"))`）；一個常態是 `r f3(lk("C", "MML1"))`。
+* D：三種校準的截距都偏，CML `r f3(lk("D", "CML"))`，每波一個常態 `r f3(lk("D", "MMLw"))`，一個常態 `r f3(lk("D", "MML1"))`。
+* 篩選每次平均拿掉 `r f2(min(link$mean_dropped))` 到 `r f2(max(link$mean_dropped))` 個點（共同題每題 3 步，一步一個點）。
+
+
+# 5 個人
+
+這一節回答：每個孩子的能力值離真值多遠，95% 區間有沒有蓋到真值？
+
+M36 的能力值是用連結換到 M03 量尺的值，所以連結的誤差也算在裡面。
+區間：估法 1–3 是 WLE ± 1.96 SE，估法 4 是 EAP ± 1.96 SD.EAP；M36 的 SE 乘上連結的斜率。
+
+```{r}
+persons <- part("persons") |>
+  mutate(method = factor(method, METHODS))
+persons |>
+  pivot_wider(id_cols = c(cohort, method), names_from = scenario,
+              values_from = c(rmse, coverage)) |>
+  arrange(cohort, method) |>
+  knitr::kable(digits = 3)
+```
+
+```{r}
+ps <- function(sc, coh, m, col = "rmse") {
+  persons[[col]][persons$scenario == sc & persons$cohort == coh & persons$method == METHODS[m]]
+}
+```
+
+依真的 θ 分 10 組（等寬，兩個世代合起來）的偏誤。
+人數少於 200（所有複製合計）的組不畫。
+
+```{r}
+cond <- part("bins") |>
+  summarise(theta = weighted.mean(theta, n), bias = weighted.mean(bias, n), n = sum(n),
+            .by = c(scenario, method, bin)) |>
+  filter(n >= 200) |>
+  mutate(method = factor(method, METHODS))
+```
+
+```{r, fig.height = 6}
+ggplot(cond, aes(theta, bias, colour = method, linetype = method, shape = method)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2) +
+  facet_wrap(~scenario, ncol = 3) +
+  method_look +
+  labs(x = "真的 θ（組內平均，M03 量尺）", y = "偏誤（估計 − 真值）")
+```
+
+```{r}
+cb <- function(sc, m, which = c("low", "high")) {
+  d <- cond |> filter(scenario == sc, method == METHODS[m]) |> arrange(theta)
+  if (match.arg(which) == "low") d$bias[1] else d$bias[nrow(d)]
+}
+```
+
+* RMSE：WLE 的三種估法裡，CML（`r f3(ps("A", "M03", 1))`）和每波一個常態（`r f3(ps("A", "M03", 3))`）在 A 的 M03 幾乎一樣。
+* 一個常態最大：M03 `r f3(ps("A", "M03", 2))`，M36 `r f3(ps("A", "M36", 2))`（CML 的 M36 是 `r f3(ps("A", "M36", 1))`）。
+* EAP 的 RMSE 最小（A 的 M03 `r f3(ps("A", "M03", 4))`）：往波次的平均縮，個別的誤差比較小。
+* 涵蓋率：CML + WLE 在 A 是 `r pct(ps("A", "M03", 1, "coverage"))`（M03）和 `r pct(ps("A", "M36", 1, "coverage"))`（M36），接近 95%。
+* 一個常態的 M36 只有 `r pct(ps("A", "M36", 2, "coverage"))`：連結的偏誤讓區間整個偏下去。
+* EAP 的區間在 A 的 M03 已經只有 `r pct(ps("A", "M03", 4, "coverage"))`，在 B1 降到 `r pct(ps("B1", "M03", 4, "coverage"))`：事前分佈不對時更差。
+* D：每一種都不到 95%，CML + WLE 的 M36 只有 `r pct(ps("D", "M36", 1, "coverage"))`。
+* 條件偏誤（圖）：A 最低的一組 CML + WLE 偏 `r f2(cb("A", 1, "low"))`，最高的一組偏 `r f2(cb("A", 1, "high"))`。
+* 這兩端是地板和天花板：0 分和滿分的 WLE 是有限的值，往中間拉。
+* 中間的組，CML + WLE 和每波一個常態 + WLE 都在 0 附近，兩條線重疊。
+* 一個常態 + WLE 是一條斜線：低的估高、高的估低（A 最低的一組 `r f2(cb("A", 2, "low"))`，最高的一組 `r f2(cb("A", 2, "high"))`）。
+* C 的兩端偏最多：CML + WLE 最高的一組偏 `r f2(cb("C", 1, "high"))`。
+
+
+# 6 群體
+
+這一節回答：每個世代 × 波次的平均、SD、P10、P50、P90，估出來的和同一群孩子真的值差多少？
+
+M36 是連結以後的值。
+
+```{r}
+groups <- part("groups") |>
+  mutate(method = factor(method, METHODS))
+```
+
+波次平均的偏誤：
+
+```{r, fig.height = 5.5}
+plot_wave_bias <- function(st, ylab) {
+  ggplot(filter(groups, stat == st), aes(wave_m, bias, colour = method, linetype = method)) +
+    geom_hline(yintercept = 0, colour = "grey60") +
+    geom_line(linewidth = 0.7) +
+    geom_point(aes(shape = method), size = 2) +
+    facet_grid(cohort ~ scenario) +
+    method_look + labs(x = "波次（月）", y = ylab)
+}
+```
+
+```{r, fig.height = 5.5}
+plot_wave_bias("mean", "平均的偏誤")
+```
+
+SD 的偏誤：
+
+```{r, fig.height = 5.5}
+plot_wave_bias("sd", "SD 的偏誤")
+```
+
+精簡的表：每個統計量在 15 個世代 × 波次的偏誤，取絕對值的最大值。
+
+```{r}
+group_tab <- groups |>
+  summarise(max_abs_bias = max(abs(bias)), .by = c(scenario, method, stat)) |>
+  pivot_wider(names_from = stat, values_from = max_abs_bias) |>
+  arrange(scenario, method)
+knitr::kable(group_tab, digits = 3)
+```
+
+```{r}
+gb <- function(sc, m, st) {
+  group_tab[[st]][group_tab$scenario == sc & group_tab$method == METHODS[m]]
+}
+gw <- function(sc, m, st, coh, w) {
+  g <- groups |> filter(scenario == sc, method == METHODS[m], stat == st)
+  g$bias[g$cohort == coh & g$wave_m == w]
+}
+```
+
+* 平均：A 的 CML + WLE，15 個波次裡最大的偏誤是 `r f3(gb("A", 1, "mean"))`（M03 的 3 個月：`r f3(gw("A", 1, "mean", "M03", 3))`，地板）。
+* 每波一個常態 + WLE 和 CML 一樣（`r f3(gb("A", 3, "mean"))`）。
+* 一個常態 + WLE 最大偏 `r f3(gb("A", 2, "mean"))`：M03 的 3 個月偏 `r f2(gw("A", 2, "mean", "M03", 3))`，M36 的 96 個月偏 `r f2(gw("A", 2, "mean", "M36", 96))`。
+* 一個常態會讓「M36 的孩子比 M03 低」，而這個差距是估法造成的。
+* EAP 的波次平均最準（A 最大 `r f3(gb("A", 4, "mean"))`）：每個波次的事前分佈就是那個波次。
+* SD：WLE 的 SD 偏大，因為測量誤差也算進去（A 的 3 個月 `r f2(gw("A", 1, "sd", "M03", 3))`）。
+* EAP 的 SD 偏小，因為往平均縮（同一波 `r f2(gw("A", 4, "sd", "M03", 3))`）。
+* 所以 P10、P90 的方向相反：WLE 的 P10 偏低、P90 偏高；EAP 相反。
+* 72 個月的 P90，WLE 偏 `r f2(gw("A", 1, "p90", "M03", 72))`：滿分的孩子都拿到同一個有限的 WLE，天花板。
+* C 把這些放大：CML + WLE 平均的最大偏誤 `r f3(gb("C", 1, "mean"))`，EAP `r f3(gb("C", 4, "mean"))`。
+* D：所有估法的波次平均都偏，CML + WLE 最大 `r f3(gb("D", 1, "mean"))`；低的波次估高、高的波次估低，量尺被壓擠。
+
+
+# 7 結論
+
+這一節回答：數字說了什麼？
+
+```{r}
+same <- link |>
+  filter(scenario %in% c("A", "B2", "C")) |>
+  select(scenario, calib, intercept_bias) |>
+  pivot_wider(names_from = calib, values_from = intercept_bias)
+same_diff <- max(abs(same[[CALIBS[["CML"]]]] - same[[CALIBS[["MMLw"]]]]))
+mml1_ac <- link$intercept_bias[link$calib == CALIBS[["MML1"]] & link$scenario != "D"]
+```
+
+1. **資料符合 PCM、每波常態時（A），CML 和每波一個常態的 MML 沒有差別。**
+   題目參數、連結、個人的 RMSE 和涵蓋率幾乎一樣；A、B2、C 的截距偏誤兩者最多差 `r f3(same_diff)`。
+   這兩種估法之間的差距，在真實資料上不用解釋成誰對誰錯。
+2. **一個常態的 MML 是會錯的那一種。**
+   M03 的步驟參數平均偏 `r f3(ib("A", "M03", "MML1"))`，連結的截距偏 `r f2(lk("A", "MML1"))`，M36 每個孩子平均偏 `r f2(ps("A", "M36", 2, "bias"))`。
+   A 到 C 的截距偏誤都在 `r f2(min(mml1_ac))` 到 `r f2(max(mml1_ac))` 之間：分佈的形狀不是主因，主因是它不知道波次。
+3. **每波一個常態的 MML 對每波的形狀敏感，CML 不敏感。**
+   左偏（B1）時連結的截距偏 `r f3(lk("B1", "MMLw"))`，CML 是 `r f3(lk("B1", "CML"))`；混合（B2）時兩者都準。
+   這個差距比一個常態的錯小 `r round(abs(lk("A", "MML1") / lk("B1", "MMLw")))` 倍左右。
+4. **地板和天花板（C）傷的是個人分數和波次的統計量，不是題目參數和連結。**
+   CML 和每波一個常態的連結截距偏誤都在 `r f3(max(abs(c(lk("C", "CML"), lk("C", "MMLw")))))` 以內。
+   但 WLE 的波次平均最多偏 `r f3(gb("C", 1, "mean"))`（A 是 `r f3(gb("A", 1, "mean"))`），在 0 分和滿分最多的波次。
+5. **模型錯時（D），CML 也沒有保護。**
+   CML 的截距偏 `r f2(lk("D", "CML"))`，和每波一個常態（`r f2(lk("D", "MMLw"))`）一樣。
+   CML 不需要分佈的假設，但仍然需要 PCM。
+6. **WLE 和 EAP 的取捨。**
+   EAP 個別的 RMSE 小、波次平均準，但 SD 和 P10、P90 往中間縮，區間的涵蓋率低於 95%，事前分佈不對時更低。
+   WLE 的波次平均（中段）也準，SD 偏大，兩端有地板和天花板。
+   兩者都不能直接給出正確的 SD 和百分位數。
+
+
+# 8 限制
+
+這一節回答：這些結論在哪些地方不能推廣？
+
+* 只有語言領域；動作、認知的題本和題數不同。
+* 每個世代 `r truth$N_CHILDREN` 個孩子，和示範資料一樣；真實資料的人數不同，抽樣誤差也不同。
+* 真值是從示範資料建出來的（示範資料本身也是模擬的），不是真實資料的參數。
+* 真值是一個 PCM，共同題在兩個世代完全相同（沒有 DIF）；真實資料的共同題有世代間的差異。
+* 沒有做接到 D 的連結。
+* 每個情境 `r reps` 次複製。
+
+
+# 參考文獻
+
+* Andersen, E. B. (1970). Asymptotic properties of conditional maximum-likelihood estimators. *Journal of the Royal Statistical Society: Series B, 32*(2), 283–301.
+* Bock, R. D., & Aitkin, M. (1981). Marginal maximum likelihood estimation of item parameters: Application of an EM algorithm. *Psychometrika, 46*(4), 443–459.
+* Chalmers, R. P., & Adkins, M. C. (2020). Writing effective and reliable Monte Carlo simulations with the SimDesign package. *The Quantitative Methods for Psychology, 16*(4), 248–280.
+* Firth, D. (1993). Bias reduction of maximum likelihood estimates. *Biometrika, 80*(1), 27–38.
+* Magis, D. (2015). A note on weighted likelihood and Jeffreys modal estimation of proficiency levels in polytomous item response models. *Psychometrika, 80*(1), 200–204.
+* Warm, T. A. (1989). Weighted likelihood estimation of ability in item response theory. *Psychometrika, 54*(3), 427–450.
+
+```{r}
+sessionInfo()$otherPkgs |> names()
+```

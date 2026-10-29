@@ -1,0 +1,708 @@
+---
+title: "kits 的演算法 7：分量表"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    embed-resources: true
+    from: markdown+east_asian_line_breaks
+    grid:
+      body-width: 1100px
+---
+
+```{=html}
+<style>
+.MathJax_Display, mjx-container { overflow-x: auto; overflow-y: hidden; }
+</style>
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+options(width = 100)
+library(kits)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+t_start <- Sys.time()
+```
+
+## 0 這份教學
+
+一個領域（例如認知）有幾個分量表，例如注意力、記憶和執行功能。
+注意力每一波都有題；記憶只到 72 個月；執行功能 84 個月以後才有題。
+每一波的題目不同，兩個波次的題目甚至可以完全不重疊；校準的鏈把它們放到同一條量尺上（[03](03_linking.html)、[06](06_scale.html) 第 4.5 節）。
+
+這份教學問四件事：
+
+1. 一個分量表在每一波的分數怎麼算？它的 SE 多大？（第 1 節）
+2. 原始分怎麼對照？（第 2 節）
+3. 成長模型放在分量表分數上，還是放在 $\theta$ 上？（第 3 節）
+4. 怎麼知道這樣做是對的？用真相已知的模擬檢查（第 4 節）。
+
+你會學到：
+
+* 每一步是做什麼用的，和它的公式（數學式，和可以一鍵複製的 `latex` 區塊）。
+* kits 的寫法只要兩、三行；手算和數值微分檢查它（印出 `TRUE`）。
+* 一個簡單的成長模型，和量尺選擇的影響。
+* 什麼時候分量表的分數可以跨波次比較，什麼時候不行（第 4.3 節的清單）。
+
+你需要：
+
+* [06 量尺](06_scale.html) 第 2 節（期望分數、訊息）和第 4 節（原始分對照）。
+* [02 計分](02_scoring.html)（WLE 和它的 SE）。
+* 套件：kits，和 dplyr、tidyr、purrr、tibble、ggplot2（`library()` 這六個）。
+  成長模型用 glmmTMB（Brooks et al., 2017）；它建在 TMB（Kristensen et al., 2016）上，和 kits 用的 RTMB 是同一家的自動微分。
+  樣條用 R 內建的 splines，模擬用 R 內建的 MASS；這三個都用 `::` 呼叫。
+
+### 0.1 小工具
+
+`same()` 容許 $10^{-12}$ 的相對誤差（加總的順序不同）：
+
+```{r}
+same <- function(a, b, tol = 1e-12) {
+  isTRUE(all.equal(as.vector(a), as.vector(b), tolerance = tol))
+}
+```
+
+`parms_of()` 把一題一個向量的步驟參數，排成 kits 認得的題目參數表（`item_id`、`item_score`、`beta`）：
+
+```{r}
+parms_of <- function(betas) {
+  tibble(item_id = rep(names(betas), lengths(betas)),
+         item_score = unlist(map(lengths(betas), seq_len)), beta = unlist(betas))
+}
+```
+
+## 1 分量表分數
+
+### 1.1 做什麼用
+
+每一波的題本不一樣，所以「分量表答對幾分」在不同波次不能直接比。
+做法是固定一組題 $S$（例如語言的 lanc01–09），問：
+
+> 在共同量尺上，能力 $\hat\theta$ 的孩子，**整組** $S$ 平均會拿幾分？
+
+這就是 $S$ 在 $\hat\theta$ 的真分數 $\tau_S(\hat\theta)$。
+每個孩子都有一個 $\tau_S$，就算他這一波沒有答到 $S$ 的每一題。
+它只借用整個領域的 $\hat\theta$；$S$ 的題目參數決定怎麼換。
+
+### 1.2 公式
+
+$$
+\tau_S(\hat\theta) = \sum_{i \in S} E(X_i \mid \hat\theta),\quad
+I_S(\theta) = \sum_{i \in S} \mathrm{Var}(X_i \mid \theta) = \frac{d\tau_S}{d\theta},\quad
+\mathrm{SE}(\tau_S) \approx I_S(\hat\theta)\,\mathrm{SE}(\hat\theta)
+$$
+
+```latex
+\tau_S(\hat\theta) = \sum_{i \in S} E(X_i \mid \hat\theta),\quad
+I_S(\theta) = \sum_{i \in S} \mathrm{Var}(X_i \mid \theta) = \frac{d\tau_S}{d\theta},\quad
+\mathrm{SE}(\tau_S) \approx I_S(\hat\theta)\,\mathrm{SE}(\hat\theta)
+```
+
+* $\tau_S$ 在 0 和 $S$ 的滿分 $K_S$ 之間。
+* $E(X_i \mid \theta)$ 和 $\mathrm{Var}(X_i \mid \theta)$ 來自 PCM（Masters, 1982）。
+* $\tau_S$ 的斜率就是 $S$ 的訊息 $I_S$（[06](06_scale.html) 第 2 節）。
+* SE 用 delta 法：$\tau_S$ 在 $\hat\theta$ 附近近似一條直線，斜率是 $I_S$，所以 SE 乘上斜率。
+* $I_S$ 小的地方（$S$ 太難或太簡單），$\tau_S$ 幾乎不動，SE 也小；那不是量得準，是量尺被壓扁了。
+
+### 1.3 用 kits
+
+示範資料 `kitm03` 的語言，整個領域一起校準、計分：
+
+```{r}
+lan03 <- kitm03$responses |> filter(domain == "lan") |> kits_resp()
+item_lan <- kits_item(lan03, scale = "lan M03")
+s_lan <- kits_subj(lan03, item_lan)
+S <- sprintf("lanc%02d", 1:9)
+```
+
+分量表分數和它的 SE，三行：
+
+```{r}
+tau_S <- kits_expected_score(item_lan, items = S)
+info_S <- kits_information(item_lan, items = S)
+sc <- as_tibble(s_lan) |> mutate(tau = tau_S(theta), se_tau = info_S(theta) * se)
+```
+
+`kits_expected_score()` 和 `kits_information()` 各回傳一個 $\theta$ 的函數；`items =` 就是 $S$。
+
+### 1.4 檢查
+
+$\tau_S$ 手算：每一題的期望分數（`algo_pcm()`）加起來。
+
+```{r}
+beta_S <- split(coef(item_lan)$beta, coef(item_lan)$item_id)[S]
+tau_hand <- map(beta_S, \(b) algo_pcm(sc$theta, b)$E) |> reduce(`+`)
+same(tau_hand, sc$tau)
+```
+
+SE：用數值微分算 $\tau_S$ 的斜率，乘上 $\mathrm{SE}(\hat\theta)$。
+
+```{r}
+h <- 1e-5
+slope_num <- (tau_S(sc$theta + h) - tau_S(sc$theta - h)) / (2 * h)
+same(slope_num * sc$se, sc$se_tau, tol = 1e-8)
+```
+
+數值微分的誤差約 $h^2$，所以這裡容許 $10^{-8}$。
+
+### 1.5 跨波次比較
+
+每一波答到幾題 $S$：
+
+```{r}
+n_S <- kitm03$responses |>
+  filter(domain == "lan", item_id %in% S) |>
+  distinct(wave_m, item_id) |>
+  count(wave_m, name = "S_items")
+```
+
+每一波的平均 $\theta$、平均 $\tau_S$ 和平均 SE：
+
+```{r}
+sc |>
+  summarise(n = n(), theta = mean(theta), sd_tau = sd(tau), tau = mean(tau),
+            se_tau = mean(se_tau), .by = wave_m) |>
+  left_join(n_S, by = "wave_m") |>
+  mutate(across(theta:se_tau, \(x) round(x, 2)))
+```
+
+* $S$ 的滿分是 `r sum(lengths(beta_S))`。$\tau_S$ 從 3 個月的幾乎 0 分，長到 72 個月接近滿分。
+* 3、6 個月只答了一、兩題 $S$；他們的 $\tau_S$ 幾乎全靠其他的題（lana）估的 $\hat\theta$，再經過模型換成 $S$ 的分數。
+  這假設 lana 和 lanc 量的是同一個能力；第 4 節用模擬看這個假設對錯時會怎樣。
+* SE 在 24 個月最大，兩端小：兩端 $S$ 太難或太簡單，$I_S$ 小，量尺被壓扁。
+* 48 到 72 個月，$\theta$ 還長了約 1.6 logit；$\tau_S$ 只長了不到 3 分。這是天花板，不是孩子不長了。
+* $\tau_S$ 的 SD 也一樣：24 個月最大，到 72 個月縮得很小。
+
+**原點不影響 $\tau_S$。**
+CML 把所有 $\beta$ 的平均定為 0；換一個原點，$\theta$ 和 $\beta$ 一起移動，$\tau_S$ 不變：
+
+```{r}
+shifted <- mutate(coef(item_lan), beta = beta + 1)
+same(kits_expected_score(shifted, items = S)(sc$theta + 1), sc$tau)
+```
+
+所以 $\tau_S$ 只要 $\hat\theta$ 和題目參數來自同一個校準（或同一條連結過的量尺）就好。
+
+## 2 原始分對照
+
+一個題本的原始分 → $\theta$（`kits_subj_table()`）→ $S$ 的期望分數。
+24 個月的標準題本（lana 加 lanc），每 6 分印一列：
+
+```{r}
+tab24 <- kits_subj_table(s_lan) |> as_tibble() |> filter(wave_m == 24)
+tibble(raw = tab24$raw, theta = tab24$theta, tau_S = tau_S(tab24$theta)) |>
+  slice(seq(1, n(), by = 6)) |> mutate(across(-raw, \(x) round(x, 2)))
+```
+
+這就是 [06](06_scale.html) 第 4 節的真分數對照，T 題本換成 $S$。
+
+* 用 $\theta$ 計分時，其實不需要原始分之間的關係（Kolen & Brennan, 2014, §6.4, p. 191）；這張表只是幫忙讀。
+* 換算表用 WLE（Warm, 1989），0 分和滿分也有數字；真分數等化本來用 MLE，兩者主要差在兩端。
+* 拿真分數的關係換觀察到的原始分，根據是實證的（§6.5.4, pp. 196-197；Lord & Wingersky, 1984）；它不依賴能力分布（§6.7, p. 201）。
+
+推導和手算都在 06 第 4 節。
+
+## 3 簡單的成長模型
+
+### 3.1 做什麼用
+
+`kitm03` 是縱貫資料：同一個孩子最多答了 9 波。
+成長模型給每個孩子一條自己的線，再看這些線的平均和散開多少（Singer & Willett, 2003）：
+
+* 平均曲線（固定效果）：一般孩子怎麼長。
+* 隨機效果的 SD：孩子之間起點和速度差多少。
+* 殘差：每一波離自己的線多遠（含測量誤差）。
+
+### 3.2 公式
+
+年齡用 $a = \log(\text{月齡}/12)$，所以截距是 12 個月。
+$\hat\theta$ 用一條直線；$\tau_S$ 有上下限，平均曲線用自然樣條 $f(a)$（3 個自由度）：
+
+$$
+\hat\theta_{ij} = \beta_0 + \beta_1 a_{ij} + u_{0i} + u_{1i} a_{ij} + \varepsilon_{ij},\quad
+\tau_{S,ij} = f(a_{ij}) + u_{0i} + u_{1i} a_{ij} + \varepsilon_{ij},\quad
+(u_{0i}, u_{1i}) \sim N(0, \Sigma),\ \varepsilon_{ij} \sim N(0, \sigma^2_{w(j)})
+$$
+
+```latex
+\hat\theta_{ij} = \beta_0 + \beta_1 a_{ij} + u_{0i} + u_{1i} a_{ij} + \varepsilon_{ij},\quad
+\tau_{S,ij} = f(a_{ij}) + u_{0i} + u_{1i} a_{ij} + \varepsilon_{ij},\quad
+(u_{0i}, u_{1i}) \sim N(0, \Sigma),\ \varepsilon_{ij} \sim N(0, \sigma^2_{w(j)})
+```
+
+* $i$ 是孩子，$j$ 是波次。
+* $\sigma^2_{w(j)}$：殘差的變異數可以每一波不同（第 3.4 節）；最簡單的模型讓它們都一樣。
+
+### 3.3 用 glmmTMB
+
+```{r}
+d <- sc |> mutate(la = log(age_m / 12))
+fit_theta <- glmmTMB::glmmTMB(theta ~ la + (la | subj_id), data = d)
+glmmTMB::fixef(fit_theta)
+glmmTMB::VarCorr(fit_theta)
+```
+
+* 12 個月的平均 $\hat\theta$ 是 `r round(glmmTMB::fixef(fit_theta)$cond[1], 2)`；年齡每乘上 $e \approx 2.7$ 倍，平均多 `r round(glmmTMB::fixef(fit_theta)$cond[2], 2)` logit。
+* 孩子之間，速度的 SD 是 `r round(attr(glmmTMB::VarCorr(fit_theta)$cond$subj_id, "stddev")[2], 2)` logit。
+
+同樣的模型放在 $\tau_S$ 上，殘差變異數都一樣：
+
+```{r}
+form_tau <- tau ~ splines::ns(la, 3) + (la | subj_id)
+fit_tau0 <- suppressWarnings(glmmTMB::glmmTMB(form_tau, data = d))
+fit_tau0$sdr$pdHess
+glmmTMB::VarCorr(fit_tau0)
+```
+
+* glmmTMB 會警告收斂有問題；這裡把警告收起來，直接看 `pdHess`（Hessian 是不是正定）。
+* `FALSE`：最大值不在內部；起點和速度的相關是 1，走到邊界了。
+* 原因是量尺：$\tau_S$ 在 3、6 個月和 72 個月幾乎每個孩子都一樣（地板和天花板），中間卻散得很開。
+  殘差變異數都一樣的模型，裝不下這個形狀。
+
+### 3.4 殘差變異數每一波不同
+
+$\tau_S$ 的 SE 每一波差很多（第 1.5 節）。
+讓殘差變異數每一波不同，只要多一個 `dispformula`：
+
+```{r}
+fit_tau <- glmmTMB::glmmTMB(form_tau, dispformula = ~ 0 + factor(wave_m), data = d)
+fit_tau$sdr$pdHess
+glmmTMB::VarCorr(fit_tau)
+round(exp(glmmTMB::fixef(fit_tau)$disp), 2)
+```
+
+* 這次是正定的。
+* `VarCorr()` 的 `Residual` 是 `NA`：殘差不再只有一個 SD。
+  每一波的殘差 SD 在 `fixef(fit_tau)$disp`；glmmTMB 的高斯分布，dispersion 是殘差的標準差，用 log 連結，所以要取 `exp()`。
+* 殘差 SD 在 24 個月最大，3 個月和 72 個月最小。
+  和 $\tau_S$ 的 SD 一樣：中間散得開，兩端被地板和天花板壓扁。
+* $\tau_S$ 上的「速度」是在 $\log$ 年齡上的直線，碰到天花板就不像直線。
+
+另一種寫法是把 SE 當成已知的殘差 SD：`dispformula = ~ 0 + offset(log(se_tau))`。
+glmmTMB 的 dispersion 是 log(SD)，所以 offset 是 log(SE)，不是 log(SE²)。
+這個模型沒有留空間給「這一波比自己的線高或低」的真實變動。
+第 4.1 節的模擬會看它的結果。
+
+### 3.5 圖：平均和幾個孩子
+
+挑 6 個孩子（不印出代號），用他們的隨機效果 $u_0$、$u_1$ 畫線。
+先照 36 個月的位置排好，再從第 10 到第 90 百分位等距挑，所以高低都有：
+
+```{r}
+re <- glmmTMB::ranef(fit_theta)$cond$subj_id |> as_tibble() |> set_names(c("u0", "u1"))
+kids <- re |>
+  arrange(u0 + u1 * log(3)) |>
+  slice(round(seq(0.1, 0.9, length.out = 6) * n())) |>
+  mutate(child = row_number())
+b <- glmmTMB::fixef(fit_theta)$cond
+```
+
+每個孩子在 $\theta$ 上是一條直線；同一條線換成 $\tau_S$：
+
+再加上 $\tau_S$ 模型的平均曲線（`wave_m` 只給殘差用，畫平均線用不到）：
+
+```{r}
+lines_kids <- expand_grid(child = kids$child, age_m = 3:72) |>
+  left_join(kids, by = "child") |>
+  mutate(theta = b[1] + u0 + (b[2] + u1) * log(age_m / 12), tau = tau_S(theta))
+lines_mean <- tibble(age_m = 3:72, theta = b[1] + b[2] * log(age_m / 12), tau = tau_S(theta))
+grid_tau <- tibble(age_m = 3:72, la = log(age_m / 12), subj_id = NA, wave_m = 12)
+curve_tau <- mutate(grid_tau, tau = predict(fit_tau, grid_tau, re.form = NA))
+long <- \(x) pivot_longer(x, c(theta, tau), names_to = "scale")
+```
+
+橫軸是對數尺度的月齡，所以 $\theta$ 上的直線畫出來也是直線：
+
+```{r}
+#| fig-width: 8
+#| fig-height: 3.5
+ggplot(long(lines_kids), aes(age_m, value)) +
+  geom_line(aes(group = child), colour = "#7F7F7F", linewidth = 0.4) +
+  geom_line(data = long(lines_mean), colour = "#0072B2", linewidth = 1) +
+  geom_line(data = mutate(curve_tau, scale = "tau", value = tau), colour = "#D55E00",
+            linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ factor(scale, c("theta", "tau")), scales = "free_y") +
+  scale_x_log10(breaks = c(3, 6, 12, 24, 36, 48, 72)) +
+  labs(x = "age (months, log scale)", y = NULL) + theme_minimal()
+```
+
+* 灰線：6 個孩子。
+* 藍線：$\hat\theta$ 模型的平均；左邊是直線，右邊是同一條線換成 $\tau_S$，也就是 $\tau_S$(平均 $\theta$)，不是 $\tau_S$ 的平均。
+* 橘色虛線：直接放在 $\tau_S$ 上的模型的平均曲線。
+* 左邊的直線，換到右邊就是 S 形：中間長得快，接近滿分就變慢。
+
+### 3.6 用哪一個量尺
+
+* $\tau_S$ 有上下限（0 到 $K_S$），而且和 $\theta$ 不是直線關係；所以 $\tau_S$ 上的成長，接近天花板一定變慢。
+* $\theta$ 上的直線成長，在 $\tau_S$ 上不是直線。
+  兩個孩子在 $\theta$ 上長得一樣快，起點不同，在 $\tau_S$ 上的速度就不同；「誰長得快」要看他站在哪裡。
+* 所以：成長模型放在 $\theta$（或 D）上；$\tau_S$ 當成讀數，把 $\theta$ 的結果換過去（右邊的藍線）。
+  $\tau_S$ 是彎的，所以 $\tau_S$(平均 $\theta$) 和平均的 $\tau_S$ 不完全一樣；要後者，就對每個孩子換過去再平均。
+* 一定要在 $\tau_S$ 上做時，讓殘差變異數每一波不同，並且只在 $S$ 量得到的年齡範圍裡解讀。
+* 加權：用 $1/\mathrm{SE}^2$ 加權、再估一個共同的 $\sigma$，等於假設殘差變異數和 $\mathrm{SE}^2$ 成正比。
+  把 SE 當成已知的殘差 SD（`offset`），更進一步假設殘差只有測量誤差。
+  兩端的 SE 很小（量尺壓扁），這些點的權重就很大，模型會被地板和天花板拉著走。
+  讓殘差變異數每一波自己估（第 3.4 節），通常比直接用 $1/\mathrm{SE}^2$ 穩。
+
+## 4 怎麼知道這樣做是對的：模擬
+
+示範資料不知道真相。
+模擬先定好真相（能力怎麼長、題目參數），再照 KIT 的設計產生作答，走一遍校準、計分和 $\tau_S$，最後和真相比。
+為了幾分鐘內跑完：每次 300 個孩子、6 波，重複 20 次，每次固定種子。
+
+### 4.1 模擬 1：真相是單向度
+
+**題本。**
+28 題分成 7 塊，每塊 4 題；第 $j$ 波答第 $j$、$j+1$ 塊。
+相鄰兩波有 4 題共同題；第一波和最後一波沒有共同題。
+
+```{r}
+waves <- c(12, 18, 24, 36, 48, 60)
+ids <- sprintf("a%02d", 1:28)
+blocks <- split(ids, rep(1:7, each = 4))
+booklet <- map(1:6, \(j) unlist(blocks[c(j, j + 1)]))
+```
+
+**真的題目參數。**
+每塊的難度跟著年齡往上；每題兩個步驟（0–2 分）。
+CML 把所有 $\beta$ 的平均定為 0，所以真的 $\beta$ 也排成平均 0，$\hat\theta$ 和 $\theta$ 就能直接比。
+
+```{r}
+centre <- rep(seq(-2.4, 2.4, length.out = 7), each = 4) + rep(c(-0.45, -0.15, 0.15, 0.45), 7)
+betas_true <- map(centre, \(b) b + c(-0.6, 0.6)) |> set_names(ids)
+round(mean(unlist(betas_true)), 12)
+```
+
+**固定的分量表** $S$：第 3、4 塊。
+第 1、5、6 波一題 $S$ 都沒答，第 2、4 波答一半：
+
+```{r}
+S1 <- unlist(blocks[3:4])
+tau_true1 <- kits_expected_score(parms_of(betas_true), items = S1)
+tibble(wave_m = waves, S_items = map_int(booklet, \(x) sum(S1 %in% x)))
+```
+
+**真的成長。**
+$\theta_{ij} = b_{0i} + b_{1i} \log(\text{月齡}_j/12) + e_{ij}$，
+$b_0 \sim N(-2.2, 0.8^2)$，$b_1 \sim N(2.6, 0.4^2)$，$e \sim N(0, 0.4^2)$：
+
+```{r}
+sim_growth <- function(n_child, mu = c(-2.2, 2.6), sd = c(0.8, 0.4), sd_e = 0.4) {
+  b0 <- rnorm(n_child, mu[1], sd[1])
+  b1 <- rnorm(n_child, mu[2], sd[2])
+  expand_grid(child = 1:n_child, wave_m = waves) |>
+    mutate(visit_id = paste(child, wave_m, sep = "_"), la = log(wave_m / 12),
+           theta = b0[child] + b1[child] * la + rnorm(n(), 0, sd_e))
+}
+```
+
+**作答。**
+先讓每個孩子答所有的題，再把這一波題本以外的題設成 `NA`：
+
+```{r}
+hide <- function(X, wave_m, booklet) {
+  for (j in seq_along(waves)) X[wave_m == waves[j], !colnames(X) %in% booklet[[j]]] <- NA
+  X
+}
+```
+
+**校準、計分、$\tau_S$。**
+用估的題目參數算 $\hat\tau_S = \tau_S(\hat\theta)$ 和它的 SE；用 `visit_id` 接回去：
+
+```{r}
+score_S <- function(d, X, S) {
+  item <- kits_item(X, scale = "sim")
+  s <- as_tibble(kits_subj(X, item)) |> select(visit_id, theta_hat = theta, se)
+  left_join(d, s, by = "visit_id") |>
+    mutate(tau_hat = kits_expected_score(item, items = S)(theta_hat),
+           se_tau = kits_information(item, items = S)(theta_hat) * se)
+}
+```
+
+一次模擬：真的 $\tau_S(\theta)$ 用真的題目參數。
+
+```{r}
+one_rep1 <- function(r) {
+  set.seed(r)
+  d <- sim_growth(300)
+  X <- kits_sim(d$theta, betas_true, seed = r) |> hide(d$wave_m, booklet)
+  rownames(X) <- d$visit_id
+  score_S(d, X, S1) |> mutate(tau = tau_true1(theta), rep = r)
+}
+```
+
+跑 20 次，再算**每一波的偏誤、RMSE 和覆蓋率**（$\pm 1.96\,\mathrm{SE}$ 包住真的 $\tau_S$ 的比例）：
+
+```{r}
+time_sim1 <- system.time(sims1 <- map(1:20, one_rep1) |> list_rbind())
+round(time_sim1[["elapsed"]])
+sims1 |>
+  summarise(bias = mean(tau_hat - tau), rmse = sqrt(mean((tau_hat - tau)^2)),
+            se_tau = mean(se_tau), cover = mean(abs(tau_hat - tau) <= 1.96 * se_tau),
+            tau = mean(tau), .by = wave_m) |>
+  mutate(across(-wave_m, \(x) round(x, 3)))
+```
+
+* 偏誤從 12 個月的 +0.15 慢慢變成 60 個月的 −0.17，都比 RMSE 小很多；沒答到 $S$ 的波次（第 1、5、6 波）也一樣。
+  真相是單向度時，鏈把 $S$ 放對了位置。
+* 覆蓋率 0.91–0.95（24 個月 0.952），其他波次比 0.95 低。
+  一個原因是 delta 法只用直線近似，$\tau_S$ 是彎的。
+  另一個原因是 SE 只算 $\hat\theta$ 的誤差，沒算題目參數的誤差；沒答到 $S$ 的波次，$S$ 的參數全靠鏈，這個誤差最大。
+* RMSE 和 SE 在中間的波次最大：那裡 $\tau_S$ 最陡，$\hat\theta$ 的誤差被放大。
+
+**成長模型。**
+每一次模擬，同一個模型各配一次真的和估的分數：
+
+```{r}
+fit_growth <- function(d, y, f = "la", disp = ~ 1) {
+  form <- reformulate(c(f, "(la | child)"), response = y)
+  fit <- suppressWarnings(glmmTMB::glmmTMB(form, data = d, dispformula = disp))
+  sds <- attr(glmmTMB::VarCorr(fit)$cond$child, "stddev")
+  grid <- tibble(la = log(waves / 12), child = NA, wave_m = waves, se_tau = 1)
+  tibble(b0 = glmmTMB::fixef(fit)$cond[1], b1 = glmmTMB::fixef(fit)$cond[2], sd_b0 = sds[1],
+         sd_b1 = sds[2], ok = fit$sdr$pdHess, curve = list(predict(fit, grid, re.form = NA)))
+}
+```
+
+* $\theta$ 用直線；$\tau_S$ 用第 3 節的樣條。
+* $\tau_S$ 的殘差變異數三種：都一樣、每一波不同、只有已知的 SE（`offset`）。
+* `ok` 記下 Hessian 是不是正定。
+
+```{r}
+ns3 <- "splines::ns(la, 3)"
+by_wave <- ~ 0 + factor(wave_m)
+known_se <- ~ 0 + offset(log(se_tau))
+```
+
+```{r}
+growth_rep <- function(d) {
+  list(theta = fit_growth(d, "theta"), theta_hat = fit_growth(d, "theta_hat"),
+       tau = fit_growth(d, "tau", ns3), tau_hat = fit_growth(d, "tau_hat", ns3),
+       tau_w = fit_growth(d, "tau", ns3, by_wave),
+       tau_hat_w = fit_growth(d, "tau_hat", ns3, by_wave),
+       tau_hat_se = fit_growth(d, "tau_hat", ns3, known_se)) |>
+    list_rbind(names_to = "model")
+}
+```
+
+$\theta$：產生資料的值是 $\beta_0 = -2.2$、$\beta_1 = 2.6$、$\mathrm{SD}(b_0) = 0.8$、$\mathrm{SD}(b_1) = 0.4$。
+20 次的平均，括號裡是 20 次之間的 SD：
+
+```{r}
+time_growth <- system.time(gr1 <- sims1 |> split(~ rep) |> map(growth_rep) |> list_rbind())
+round(time_growth[["elapsed"]])
+mean_sd <- \(x) sprintf("%.2f (%.2f)", mean(x), sd(x))
+gr1 |>
+  filter(model %in% c("theta", "theta_hat")) |>
+  summarise(across(b0:sd_b1, mean_sd), ok = mean(ok), .by = model)
+```
+
+* 平均的截距、斜率，和起點、速度的 SD，用 $\hat\theta$ 都找回來了。
+* 測量誤差跑到殘差裡，不影響這些數字。
+
+$\tau_S$：沒有「產生資料的值」，所以和配在真的 $\tau_S$ 上的同一個模型比。
+平均曲線是 12 和 60 個月的固定效果；`ok` 是 Hessian 正定的比例：
+
+```{r}
+gr1 |>
+  filter(grepl("tau", model)) |>
+  mutate(at_12m = map_dbl(curve, 1), at_60m = map_dbl(curve, 6)) |>
+  summarise(across(c(at_12m, at_60m, sd_b0, sd_b1), mean_sd), ok = mean(ok), .by = model)
+```
+
+* 平均曲線：估的和真的很接近。分量表分數的平均可以跨波次比。
+* 速度的 SD：殘差變異數都一樣時，估的（`tau_hat`）比真的（`tau`）小；每一波不同時（`_w`），兩個接近。
+* 只用已知的 SE（`tau_hat_se`）時，平均曲線還接近，但速度的 SD 是 `r round(mean(gr1$sd_b1[gr1$model == "tau_hat_se"]), 2)`，比兩個真的都大。
+  殘差只剩測量誤差；每一波真實的上下變動，被擠進了孩子之間的差異。
+* 140 個模型裡，Hessian 不是正定的有 `r sum(!gr1$ok)` 個（`r paste(unique(gr1$model[!gr1$ok]), collapse = "、")`）。
+  它是殘差變異數都一樣的 $\tau_S$ 模型，和第 3.3 節同樣的問題。
+* 所以在 $\tau_S$ 上做成長模型，殘差變異數要每一波不同。
+
+### 4.2 模擬 2：真相是兩個向度
+
+模擬 1 的真相只有一個能力，所以 $\tau_S$ 的平均沒有系統偏誤。
+真的分量表如果長得不一樣呢？
+
+**設計。**
+
+* 兩個分量表 A、B 有關，但 A 長得快、B 長得慢。
+* A、B 各 21 題，各自和模擬 1 一樣串成鏈：第 $j$ 波答第 $j$、$j+1$ 塊（一塊 3 題）。
+* 第三個分量表 C 只在 48、60 個月有題（例如只有大孩子才考的執行功能）。
+  C 其實很早就在了，長得很慢；但早的波次沒有任何 C 的題。
+
+```{r}
+make_betas <- function(prefix, centres, k = 3) {
+  centre <- rep(centres, each = k) + rep(seq(-0.3, 0.3, length.out = k), length(centres))
+  map(centre, \(b) b + c(-0.6, 0.6)) |> set_names(sprintf("%s%02d", prefix, seq_along(centre)))
+}
+betas_2 <- c(make_betas("A", seq(-2.6, 3, length.out = 7)),
+             make_betas("B", seq(-1.3, 1.9, length.out = 7)), make_betas("C", c(0.8, 1.6)))
+```
+
+```{r}
+blk <- function(p, j) sprintf("%s%02d", p, (3 * j - 2):(3 * j + 3))
+booklet_2 <- map(1:6, \(j) c(blk("A", j), blk("B", j), if (j >= 5) sprintf("C%02d", 1:6)))
+sets <- map(c(A = "A", B = "B", C = "C"), \(p) grep(p, names(betas_2), value = TRUE))
+tau_true2 <- map(sets, \(x) kits_expected_score(parms_of(betas_2), items = x))
+```
+
+真的成長：三個能力的起點兩兩相關 0.7，速度也兩兩相關 0.7；起點和速度之間不相關。
+
+```{r}
+mu0 <- c(A = -2.2, B = -1.0, C = 0.3)
+mu1 <- c(A = 3.0, B = 1.6, C = 0.6)
+R3 <- matrix(0.7, 3, 3) + diag(0.3, 3)
+```
+
+```{r}
+sim_3d <- function(n_child) {
+  b0 <- MASS::mvrnorm(n_child, mu0, 0.8^2 * R3)
+  b1 <- MASS::mvrnorm(n_child, mu1, 0.3^2 * R3)
+  d <- expand_grid(child = 1:n_child, wave_m = waves) |>
+    mutate(visit_id = paste(child, wave_m, sep = "_"), la = log(wave_m / 12))
+  list(d = d, theta = b0[d$child, ] + b1[d$child, ] * d$la + rnorm(3 * nrow(d), 0, 0.4))
+}
+```
+
+**三種 $\tau$。**
+
+* `true`：真的能力，真的題目參數。
+* `domain`：整個領域（A、B、C 一起）校準一次，一個 $\hat\theta$，再換成每個分量表的 $\tau$。
+* `separate`：每個分量表自己校準、自己計分。C 只有 48、60 個月有資料，所以只有那兩波。
+
+```{r}
+theta_of <- function(X, item) {
+  s <- as_tibble(kits_subj(X, item))
+  set_names(s$theta, s$visit_id)
+}
+```
+
+```{r}
+tau_separate <- function(Xp) {
+  Xp <- Xp[rowSums(!is.na(Xp)) > 0, ]
+  item_p <- kits_item(Xp, scale = "subscale")
+  th <- theta_of(Xp, item_p)
+  set_names(kits_expected_score(item_p)(th), names(th))
+}
+```
+
+作答：每個分量表用自己的能力，再把題本以外的題設成 `NA`：
+
+```{r}
+sim_X <- function(sim, r) {
+  X <- map2(names(sets), 10 * r + 1:3,
+            \(p, k) kits_sim(sim$theta[, p], betas_2[sets[[p]]], seed = k))
+  X <- reduce(X, cbind) |> hide(sim$d$wave_m, booklet_2)
+  rownames(X) <- sim$d$visit_id
+  X
+}
+```
+
+一次模擬：
+
+```{r}
+one_rep2 <- function(r) {
+  set.seed(r)
+  sim <- sim_3d(300)
+  three_ways(sim, sim_X(sim, r)) |> mutate(rep = r)
+}
+```
+
+```{r}
+three_ways <- function(sim, X) {
+  item_d <- kits_item(X, scale = "domain")
+  theta_d <- theta_of(X, item_d)[sim$d$visit_id]
+  map(names(sets), \(p) mutate(sim$d, subscale = p, true = tau_true2[[p]](sim$theta[, p]),
+                               domain = kits_expected_score(item_d, items = sets[[p]])(theta_d),
+                               separate = tau_separate(X[, sets[[p]]])[visit_id])) |>
+    list_rbind()
+}
+```
+
+跑 20 次，算**每一波的平均 $\tau$**：
+
+```{r}
+time_sim2 <- system.time(sims2 <- map(1:20, one_rep2) |> list_rbind())
+round(time_sim2[["elapsed"]])
+means2 <- sims2 |>
+  summarise(across(c(true, domain, separate), mean), .by = c(subscale, wave_m))
+means2 |> mutate(across(true:separate, \(x) round(x, 2)))
+```
+
+**從 12 到 60 個月長了多少**，和每個孩子的 RMSE：
+
+```{r}
+sims2 |>
+  summarise(gain_true = mean(true[wave_m == 60]) - mean(true[wave_m == 12]),
+            gain_domain = mean(domain[wave_m == 60]) - mean(domain[wave_m == 12]),
+            gain_separate = mean(separate[wave_m == 60]) - mean(separate[wave_m == 12]),
+            rmse_domain = sqrt(mean((domain - true)^2)),
+            rmse_separate = sqrt(mean((separate - true)^2, na.rm = TRUE)), .by = subscale) |>
+  mutate(across(-subscale, \(x) round(x, 2)))
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 3.2
+pivot_longer(means2, true:separate, names_to = "tau", values_drop_na = TRUE) |>
+  ggplot(aes(wave_m, value, colour = tau)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.2) +
+  facet_wrap(~ subscale) +
+  scale_colour_manual(values = c(true = "#7F7F7F", domain = "#D55E00", separate = "#0072B2")) +
+  labs(x = "wave (months)", y = "mean tau", colour = NULL) +
+  theme_minimal()
+```
+
+* **A 和 B（兩個向度）。**
+  整個領域只有一個 $\hat\theta$，所以 A、B 的 $\tau$ 跟著同一條成長走：A 長得比真的慢，B 長得比真的快。
+  一個領域的 $\hat\theta$ 分不出兩個分量表不同的成長。
+* 各自校準時，A、B 的成長都找回來了：每個分量表自己有一條鏈。
+* 每個孩子的 RMSE：A、B 都是各自校準比較小，但只小一點。
+  各自校準只用分量表自己的 6 題，測量誤差比較大；它主要修好的是平均的成長。
+* C 的兩個 RMSE 不能比：`separate` 只有 48、60 個月，`domain` 還包括早的波次的外插。
+* **C（只有後期有題）。**
+  48、60 個月兩種算法都接近真的。
+  早的波次只有 `domain` 有數字：它是用整個領域的成長往回推的，完全是外插。
+  真的 C 長得慢，所以往回推的數字太低；資料裡沒有任何東西能檢查這一點。
+* 所以，C 只在 48、60 個月之間比較；它和早的波次沒有連結。
+
+### 4.3 清單：分量表的真分數什麼時候可以跨波次比
+
+1. **同一條量尺。** $S$ 的題和其他波次的題，經過共同題的鏈（或連結）在同一個校準裡。兩個波次自己不必有共同題。
+2. **固定的 $S$。** 每一波用同一組題算 $\tau_S$；不是「這一波答到的 $S$ 的題」。
+3. **單向度。** $\tau_S(\hat\theta)$ 借用整個領域的 $\hat\theta$。
+   分量表和領域長得不一樣時（模擬 2 的 A、B），它就錯了。
+   檢查：分量表自己有鏈時，各自校準一次，和整個領域的 $\tau_S$ 比每一波的平均。
+4. **有題的範圍。** 沒有任何 $S$ 的題（或接到 $S$ 的題）的波次，$\tau_S$ 是外插。
+   只在後期才有的分量表（模擬 2 的 C），只在它有題的波次之間比較。
+5. **天花板和地板。** $\tau_S$ 接近 0 或滿分時，SE 小是因為量尺被壓扁，成長也一定變慢。
+6. **SE。** $I_S(\hat\theta)\,\mathrm{SE}(\hat\theta)$；模擬 1 的覆蓋率 0.91–0.95，大多比 0.95 低。
+   它沒算題目參數的誤差；沒答到 $S$ 的波次最明顯。
+7. **成長模型。** 放在 $\theta$（或 D）上，$\tau_S$ 當成讀數；要在 $\tau_S$ 上做，殘差變異數每一波不同。
+
+## 5 接下來
+
+* 原始分對照的原理：[06 量尺](06_scale.html) 第 4 節。
+* 從頭讀起：[01 校準](01_calibration.html)、[02 計分](02_scoring.html)、[03 連結](03_linking.html)、[04 常模](04_norms.html)、[05 檢查](05_checks.html)。
+* 每個模型在 RTMB 裡怎麼寫：[kits 的模型](../tutorial_models/kits_models.html)。
+
+全部算完的時間：
+
+```{r}
+round(difftime(Sys.time(), t_start, units = "secs"))
+```
+
+## 參考文獻
+
+* Brooks, M. E., Kristensen, K., van Benthem, K. J., Magnusson, A., Berg, C. W., Nielsen, A., Skaug, H. J., Mächler, M., & Bolker, B. M. (2017). glmmTMB balances speed and flexibility among packages for zero-inflated generalized linear mixed modeling. *The R Journal, 9*(2), 378-400. doi:10.32614/RJ-2017-066
+* Kolen, M. J., & Brennan, R. L. (2014). *Test equating, scaling, and linking* (3rd ed.). Springer. doi:10.1007/978-1-4939-0317-7（§6.4, p. 191；§6.5, pp. 192-197；§6.5.4, pp. 196-197；§6.7, p. 201）
+* Kristensen, K., Nielsen, A., Berg, C. W., Skaug, H., & Bell, B. M. (2016). TMB: Automatic differentiation and Laplace approximation. *Journal of Statistical Software, 70*(5), 1-21. doi:10.18637/jss.v070.i05
+* Lord, F. M., & Wingersky, M. S. (1984). Comparison of IRT true-score and equipercentile observed-score "equatings". *Applied Psychological Measurement, 8*(4), 453-461. doi:10.1177/014662168400800409
+* Masters, G. N. (1982). A Rasch model for partial credit scoring. *Psychometrika, 47*(2), 149-174. doi:10.1007/BF02296272
+* Singer, J. D., & Willett, J. B. (2003). *Applied longitudinal data analysis: Modeling change and event occurrence*. Oxford University Press. doi:10.1093/acprof:oso/9780195152968.001.0001
+* Warm, T. A. (1989). Weighted likelihood estimation of ability in item response theory. *Psychometrika, 54*(3), 427-450. doi:10.1007/BF02294627

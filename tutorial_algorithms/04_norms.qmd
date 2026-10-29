@@ -1,0 +1,764 @@
+---
+title: "演算法 4：常模"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    embed-resources: true
+    grid:
+      body-width: 1100px
+from: markdown+east_asian_line_breaks
+---
+
+```{=html}
+<style>
+.MathJax_Display, mjx-container { overflow-x: auto; overflow-y: hidden; }
+</style>
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+options(width = 100)
+library(kits)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+t_start <- Sys.time()
+```
+
+這是六份演算法教學的第四份。
+[03_linking](03_linking.html) 把分數換到 D。
+這一份用 D 做常模：每個月齡的分數分布，和每個孩子在同齡孩子裡的位置（同齡 z）。
+
+你會學到：
+
+* 為什麼先篩掉「很多孩子擠在最低分」的波次，常模的月齡範圍怎麼定。
+* sinh-arcsinh（shash）分布：四個參數各管什麼。
+* 四個參數怎麼隨月齡變（多項式），怎麼用最大概似估計。
+* 常模表的百分位、同齡 z 和百分等級怎麼從四個參數算出來。
+
+你需要：
+
+* R 和 kits `r packageVersion("kits")`，以及 dplyr、tidyr、purrr、tibble、ggplot2。
+* 知道 `kits_convert()` 換算後的分數（[03_linking](03_linking.html)）。
+* 看 RTMB 怎麼寫 shash 的概似時，讀 [kits 的模型](../tutorial_models/kits_models.html) 的第 8 節；這裡不重複。
+
+每一節都照同樣的順序走：
+
+1. 這一步要做什麼（白話）。
+2. 公式：排好的數學式，下面是同一條式子的 LaTeX，按一下就能複製。
+3. 用示範資料一小段一小段手算。
+4. 用 kits 的兩層函數再算一次：`kits_` 的步驟（會檢查、會記下設定）和 `algo_` 的積木（只有算法）。
+   每次都用 `identical()` 對答案；只有運算的順序或方法不同時，才用 `all.equal()` 或最大差距，並寫出容許誤差。
+5. 套件裡的教學程式在哪一段，便宜的就直接跑。
+
+
+## 0 準備
+
+### 0.1 這個算法有幾步
+
+常模在 kits 裡是兩個算法：先篩波次、定月齡（`"norm_screen"`），再配 shash（`"norms"`）。
+
+```{r}
+kits_algorithm("norm_screen")
+```
+
+```{r}
+kits_algorithm("norms")
+```
+
+`"norms"` 的 `Components` 第三行是 `algo_` 的積木；它們實際的寫法是 `algo_shash(x, D)`，`x` 是轉換過的月齡（例如 `sqrt(age_m)`），再接 `algo_shash_z(x, D)`（第 5、7 節）。
+
+### 0.2 示範資料：D 分數
+
+示範資料是模擬的（`?kitm03`），沒有真實孩子的資料。
+`kitm03` 的一個世代從 3 個月追到 72 個月，共 9 個波次。
+語言的分數接到 D，用語言和動作的錨題（[03_linking](03_linking.html) 第 5 節）。
+常模不需要連結誤差，所以這裡不重抽（`n_boot = 0`）。
+
+```{r}
+lan03 <- filter(kitm03$responses, domain == "lan")
+motor03 <- filter(kitm03$responses, domain == "motor")
+item03 <- kits_item(lan03, scale = "lan M03")
+item_motor <- kits_item(motor03, scale = "motor M03")
+d_link <- kits_linking(list(lan = item03, motor = item_motor), kitm03$anchors)
+```
+
+每個人次的波次、月齡、性別用 `persons` 接上：
+
+```{r}
+persons03 <- distinct(lan03, visit_id, cohort, wave_m, age_m, sex)
+lan <- lan03 |>
+  kits_subj(item03, persons = persons03) |>
+  kits_convert(d_link)
+as_tibble(lan) |>
+  summarise(n = n(), median_D = round(median(theta), 1), .by = wave_m)
+```
+
+### 0.3 小工具
+
+教學程式是套件裡的 `.R` 檔，每一段用 `# ==== part: 名字 ====` 開頭。
+`show_part()` 只印其中一段：從這一行印到下一個 `# ====` 之前。
+
+```{r}
+read_part <- function(file, part) {
+  code <- readLines(system.file("scripts", file, package = "kits"))
+  start <- grep(paste0("# ==== part: ", part, " ===="), code, fixed = TRUE)
+  if (length(start) != 1) stop("no part ", part, " in ", file)
+  heads <- grep("^# ====", code)
+  end <- c(heads[heads > start], length(code) + 1)[1] - 1
+  code[start:end]
+}
+```
+
+```{r}
+show_part <- function(file, part) cat("```r", read_part(file, part), "```", sep = "\n")
+run_script <- function(file) {
+  env <- new.env(parent = globalenv())
+  path <- system.file("scripts", file, package = "kits")
+  printed <- capture.output(suppressMessages(sys.source(path, envir = env)))
+  env
+}
+```
+
+常模表記下呼叫它的那一行字（`attr(, "info")$call`）。
+一步一步接起來的表和一次呼叫的表，只有這一行字不同；`without_call()` 拿掉它：
+
+```{r}
+without_call <- function(x) {
+  attr(x, "info")$call <- NULL
+  x
+}
+```
+
+
+## 1 篩掉擠在最低分的波次
+
+### 1.1 這一步要做什麼
+
+很多孩子擠在最低分時，分數分不出誰落後。
+百分位曲線也會被拉平，分布不連續，配起來不穩定。
+常模最重要的用處（找出落後的孩子）就沒了。
+所以先算每個波次有幾 % 的孩子在最低分，太多的波次不放進常模。
+
+### 1.2 公式
+
+$$
+\mathit{floor\_pct}_w = \operatorname{round}\Big(100\cdot\frac{\#\{p \in w : D_p = \min_{q \in w} D_q\}}{n_w},\ 1\Big);
+\qquad w \text{ left out if } \mathit{floor\_pct}_w \ge \mathit{cut}
+$$
+
+```latex
+\mathit{floor\_pct}_w = \operatorname{round}\Big(100\cdot\frac{\#\{p \in w : D_p = \min_{q \in w} D_q\}}{n_w},\ 1\Big);
+\qquad w \text{ left out if } \mathit{floor\_pct}_w \ge \mathit{cut}
+```
+
+* $w$ 是一個（世代 ×）波次；$n_w$ 是這個波次 D 有限的人次。
+* D 先取到小數點下 3 位，避免同樣的最低分因為浮點誤差被當成不同。
+* 百分比先取到小數點下 1 位，再和 $\mathit{cut}$（預設 20）比。
+* 擠在最高分（天花板）的波次仍然放進常模。
+
+### 1.3 手算
+
+```{r}
+hand_waves <- as_tibble(lan) |>
+  transmute(D = round(theta, 3), wave_m, cohort) |>
+  filter(is.finite(D), !is.na(wave_m)) |>
+  summarise(n = n(), floor_pct = round(100 * mean(D == min(D)), 1),
+            .by = c(cohort, wave_m)) |>
+  mutate(normed = floor_pct < 20) |>
+  arrange(cohort, wave_m)
+hand_waves
+```
+
+3 個月有 `r hand_waves$floor_pct[1]`% 的孩子在最低分，超過 20%，所以不放進常模。
+每個人次跟著自己的波次：
+
+```{r}
+kept_waves <- filter(hand_waves, normed)$wave_m
+hand_normed <- is.finite(lan$theta) & lan$wave_m %in% kept_waves
+table(hand_normed)
+```
+
+### 1.4 用 kits
+
+`kits_norm_screen()` 直接吃換算好的分數表（`theta`、`wave_m`、`cohort` 都在裡面）：
+
+```{r}
+screen <- kits_norm_screen(lan)
+c(floor_pct = identical(screen$waves$floor_pct, hand_waves$floor_pct),
+  waves = identical(screen$waves$normed, hand_waves$normed),
+  normed = identical(screen$normed, hand_normed))
+```
+
+也可以給三個向量，結果相同：
+
+```{r}
+screen_v <- kits_norm_screen(lan$theta, lan$wave_m, cohort = lan$cohort)
+identical(screen_v$normed, screen$normed)
+```
+
+這一步沒有 `algo_` 的積木：它只是計數。
+
+### 1.5 讀這個百分比時
+
+* 一個波次有幾個作答組合時，每個組合的最低原始分對到不同的 D，所以這個百分比會低估。
+  這時可以分開看每個作答組合。
+* 兩個世代有同一個波次時（例如 36 個月），`cohort` 讓兩個世代分開算。
+* 百分比先取到小數點下 1 位：例如 19.96% 算成 20.0%，`cut = 20` 時不放進常模。
+
+
+## 2 常模的月齡
+
+### 2.1 這一步要做什麼
+
+常模表一列是一個月齡，每半個月一列。
+少數特別小或特別大的孩子，不該把常模拉到幾乎沒有資料的月齡。
+所以範圍從第一個波次月齡的 1 百分位，到最後一個波次月齡的 99 百分位，兩端往外取到半個月。
+
+### 2.2 公式
+
+$$
+\text{ages} = \mathit{by}\lfloor Q_{p_1}(\text{age}\mid\text{first wave})/\mathit{by}\rfloor,\ \dots,\
+\mathit{by}\lceil Q_{p_2}(\text{age}\mid\text{last wave})/\mathit{by}\rceil
+$$
+
+```latex
+\text{ages} = \mathit{by}\lfloor Q_{p_1}(\text{age}\mid\text{first wave})/\mathit{by}\rfloor,\ \dots,\
+\mathit{by}\lceil Q_{p_2}(\text{age}\mid\text{last wave})/\mathit{by}\rceil
+```
+
+* $Q$ 是 R 的 `quantile()`（type 7）；$p_1 = 0.01$、$p_2 = 0.99$；$\mathit{by} = 0.5$ 個月。
+* 第一個、最後一個波次是放進常模的波次裡 `wave_m` 最小、最大的。
+
+### 2.3 手算
+
+```{r}
+use <- lan[screen$normed, ]
+first <- use$age_m[use$wave_m == min(use$wave_m)]
+last <- use$age_m[use$wave_m == max(use$wave_m)]
+lo <- floor(quantile(first, 0.01, names = FALSE) / 0.5) * 0.5
+hi <- ceiling(quantile(last, 0.99, names = FALSE) / 0.5) * 0.5
+c(lo = lo, hi = hi)
+```
+
+`seq()` 的最後一位可能有很小的浮點誤差，所以取到小數點下 10 位：
+
+```{r}
+hand_ages <- round(seq(lo, hi, by = 0.5), 10)
+length(hand_ages)
+```
+
+### 2.4 用 kits
+
+```{r}
+ages <- kits_norm_ages(use$age_m, use$wave_m)
+c(vectors = identical(ages, hand_ages), table = identical(kits_norm_ages(use), hand_ages))
+```
+
+### 2.5 教學程式
+
+`norm_screen.R` 的兩段就是第 1、2 節。
+它的輸入是示範資料語言的 WLE（lan M03 的量尺，還沒換到 D）；換算是一條直線，所以篩出的波次一樣。
+
+```{r, results = "asis"}
+show_part("norm_screen.R", "screen")
+show_part("norm_screen.R", "ages")
+```
+
+整份程式在乾淨的環境裡跑一次，再和 kits 比：
+
+```{r}
+env_screen <- run_script("norm_screen.R")
+screen_script <- kits_norm_screen(env_screen$D, env_screen$wave_m, cohort = env_screen$cohort)
+c(floor_pct = identical(env_screen$waves$floor_pct, screen_script$waves$floor_pct),
+  normed = identical(env_screen$normed, screen_script$normed),
+  same_waves_as_D = identical(env_screen$waves$normed, screen$waves$normed))
+```
+
+
+## 3 常模用的資料
+
+### 3.1 這一步要做什麼
+
+配常模只用分數和月齡都有限、月齡在 `ages` 兩端再往外 `pad` 個月（預設 1）以內的人次。
+多用一點兩端外的資料，曲線在兩端比較穩。
+表的月齡也不超出資料：從資料最小月齡的 `floor()` 到最大月齡的 `ceiling()`。
+
+### 3.2 公式
+
+$$
+\min(\text{ages}) - \mathit{pad} \le \text{age}_p \le \max(\text{ages}) + \mathit{pad}
+$$
+
+```latex
+\min(\text{ages}) - \mathit{pad} \le \text{age}_p \le \max(\text{ages}) + \mathit{pad}
+```
+
+### 3.3 手算
+
+```{r}
+hand_data <- tibble(d = use$theta, age_m = use$age_m) |>
+  filter(is.finite(d), is.finite(age_m)) |>
+  filter(age_m >= min(ages) - 1, age_m <= max(ages) + 1)
+nrow(hand_data)
+```
+
+### 3.4 用 kits
+
+`kits_norm_data()` 是 `kits_norms()` 的第 1 步：
+
+```{r}
+norm_data <- kits_norm_data(use$theta, use$age_m, ages)
+c(d = identical(norm_data$d, hand_data$d), age_m = identical(norm_data$age_m, hand_data$age_m),
+  ages = identical(attr(norm_data, "norm")$ages, ages))
+```
+
+`attr(norm_data, "norm")` 記下 `ages`、`pad` 和月齡的轉換（`age_x = sqrt`），下一步用。
+
+
+## 4 shash 分布
+
+### 4.1 這一步要做什麼
+
+每個月齡的分數分布不一定對稱，偏態和尾巴的厚薄也會隨月齡改變。
+sinh-arcsinh（shash）分布用四個參數描述一個分布（Jones & Pewsey, 2009）：
+
+* $\mu$：位置；$\sigma$：尺度。
+* $\varepsilon$：偏態（0 是對稱）。
+* $\delta$：尾巴的厚薄（1 是常態的尾巴；小於 1 尾巴比較厚）。
+
+$\varepsilon = 0$、$\delta = 1$ 時，就是常態分布。
+分數可以是 0 或負的，不用先加一個常數。
+
+### 4.2 公式
+
+一個分數 $D$ 的對數密度，$u = (D - \mu)/\sigma$：
+
+$$
+\log f = \log\delta - \log\sigma - \tfrac12\log 2\pi - \tfrac12\log(1+u^2)
+- \tfrac12\sinh^2(\delta\operatorname{asinh}u + \varepsilon) + \log\cosh(\delta\operatorname{asinh}u + \varepsilon)
+$$
+
+```latex
+\log f = \log\delta - \log\sigma - \tfrac12\log 2\pi - \tfrac12\log(1+u^2)
+- \tfrac12\sinh^2(\delta\operatorname{asinh}u + \varepsilon) + \log\cosh(\delta\operatorname{asinh}u + \varepsilon)
+```
+
+### 4.3 手算
+
+照公式寫一個函數，和 $\varepsilon = 0$、$\delta = 1$ 的常態密度比：
+
+```{r}
+log_f <- function(D, mu, sigma, epsilon, delta) {
+  u <- (D - mu) / sigma
+  a <- delta * asinh(u) + epsilon
+  log(delta) - log(sigma) - 0.5 * log(2 * pi) - 0.5 * log(1 + u^2) -
+    0.5 * sinh(a)^2 + log(cosh(a))
+}
+D <- c(40, 50, 60)
+all.equal(log_f(D, 50, 8, 0, 1), dnorm(D, 50, 8, log = TRUE), tolerance = 1e-12)
+```
+
+兩者只差運算的方法（`sinh(asinh(u))` 和 `u`），所以用 `all.equal()`（$10^{-12}$）。
+
+### 4.4 四個參數的樣子
+
+同樣的 $\mu = 50$、$\sigma = 8$，改 $\varepsilon$ 和 $\delta$：
+
+```{r, fig.width = 7, fig.height = 3.5}
+shapes <- tibble(shape = c("normal", "epsilon = 0.5", "delta = 0.7"),
+                 epsilon = c(0, 0.5, 0), delta = c(1, 1, 0.7))
+curves <- shapes |>
+  reframe(D = seq(20, 80, by = 0.5), f = exp(log_f(D, 50, 8, epsilon, delta)), .by = shape)
+ggplot(curves, aes(D, f, colour = shape)) +
+  geom_line() +
+  scale_colour_manual(values = c("#7F7F7F", "#0072B2", "#D55E00"))
+```
+
+
+## 5 最大概似：`kits_norm_fit()`、`algo_shash()`
+
+### 5.1 這一步要做什麼
+
+常模是連續的：四個參數都是月齡的平滑函數（Lenhard & Lenhard, 2021）。
+月齡先開根號、再標準化成 $x$；每個參數是 $x$ 的多項式。
+$\sigma$、$\delta$ 用 log，保證是正的。
+所有孩子的 $\log f$ 加起來是對數概似；找讓它最大的係數。
+kits 只寫 $-\log L$，梯度和 Hessian 由 RTMB 自動微分給（RTMB 的程式見 [kits 的模型](../tutorial_models/kits_models.html) 第 8 節）。
+
+### 5.2 公式
+
+月齡和四個多項式：
+
+$$
+x = (\operatorname{age\_x}(\text{age}) - m) / s
+$$
+
+```latex
+x = (\operatorname{age\_x}(\text{age}) - m) / s
+```
+
+$$
+\mu(x) = \sum_j c^{(\mu)}_j x^j,\ \log\sigma(x) = \sum_j c^{(\sigma)}_j x^j,\ \varepsilon(x)
+= \sum_j c^{(\varepsilon)}_j x^j,\ \log\delta(x) = \sum_j c^{(\delta)}_j x^j
+$$
+
+```latex
+\mu(x) = \sum_j c^{(\mu)}_j x^j,\ \log\sigma(x) = \sum_j c^{(\sigma)}_j x^j,\ \varepsilon(x)
+= \sum_j c^{(\varepsilon)}_j x^j,\ \log\delta(x) = \sum_j c^{(\delta)}_j x^j
+```
+
+界限（和 cNORM 的 `cnorm.shash()` 相同）：
+
+$$
+\log\sigma,\ \varepsilon \in [-10, 10],\quad \log\delta \in [-2, 2]
+$$
+
+```latex
+\log\sigma,\ \varepsilon \in [-10, 10],\quad \log\delta \in [-2, 2]
+```
+
+* `age_x` 預設是 `sqrt`；$m$、$s$ 是資料裡 $\sqrt{\text{age}}$ 的平均和 SD。
+* `degrees = c(5, 4, 3, 2)` 是四個多項式的最高次數（給 KIT 約 12 個波次）；2 到 5 個波次用低一點的，例如 `c(3, 2, 1, 1)`。
+* 係數共 $6 + 5 + 4 + 3 = 18$ 個。
+* 起始值：$\mu$ 是 D 的平均，$\log\sigma$ 是 $\log\mathrm{SD}(D)$，$\varepsilon = 0$，$\log\delta = \log\delta_0$。
+* 概似有多個局部解，所以每個 $\delta_0$（`delta_starts = c(0.5, 1, 1.5, 2)`）各配一次，留下 $-\log L$ 最小的。
+* 最佳化：`nlminb()`，用 RTMB 的梯度和 Hessian。cNORM 用 `optim()` 的 L-BFGS-B；兩者走到同一個解，數字差到約 $10^{-6}$。
+* 收斂：和 `kits_item()` 相同；不在界上的係數，最大 |梯度| $\le 10^{-4}$，而且它們的 Hessian 正定。沒收斂時，從停下的地方再走（最多 3 次）。
+
+### 5.3 用 kits
+
+`kits_norm_fit()` 是第 2 步，四個起始值各配一次（約 4 秒）：
+
+```{r}
+fit <- kits_norm_fit(norm_data)
+fit
+```
+
+`algo_shash()` 是一個起始值的配適。
+四個起始值各跑一次，留下最好的，就是 `kits_norm_fit()` 的模型：
+
+```{r}
+x_age <- sqrt(norm_data$age_m)
+fits <- map(c(0.5, 1, 1.5, 2), \(d0) algo_shash(x_age, norm_data$d, delta0 = d0))
+best <- fits[[which.min(map_dbl(fits, "value"))]]
+map_dbl(fits, "value")
+identical(best, fit$model)
+```
+
+這份資料前三個起始值走到同一個解。
+$\delta_0 = 2$ 停在 $-\log L$ 大很多的地方，沒有收斂（上面的警告）。
+所以要試好幾個起始值，留下最好的。
+
+### 5.4 手算：對數概似
+
+用 `best` 的係數，每個孩子的月齡算四個參數，照 4.2 節的 $\log f$ 加起來。
+先是標準化的月齡和多項式：
+
+```{r}
+x <- (x_age - best$age_mean) / best$age_sd
+poly <- function(cf, x) drop(outer(x, seq_along(cf) - 1, "^") %*% cf)
+keep_in <- function(v, bound) pmin(pmax(v, -bound), bound)
+c(m = identical(best$age_mean, mean(x_age)), s = identical(best$age_sd, sd(x_age)))
+```
+
+```{r}
+mu <- poly(best$mu_est, x)
+sigma <- exp(keep_in(poly(best$sigma_est, x), 10))
+epsilon <- keep_in(poly(best$epsilon_est, x), 10)
+delta <- exp(keep_in(poly(best$delta_est, x), 2))
+neg_loglik <- -sum(log_f(norm_data$d, mu, sigma, epsilon, delta))
+c(by_hand = neg_loglik, kits = fit$model$value)
+```
+
+```{r}
+all.equal(neg_loglik, fit$model$value, tolerance = 1e-12)
+```
+
+kits 的 $\log\cosh$ 和 $\log(1 + u^2)$ 用比較穩的寫法（`log1p()`），所以只到 $10^{-12}$ 以內相同。
+
+### 5.5 教學程式
+
+`norms.R` 的 `fit` 段：`nll()` 就是 $-\sum\log f$，`clamp()` 是可以微分的界限。
+
+```{r, results = "asis"}
+show_part("norms.R", "fit")
+```
+
+
+## 6 常模表：`kits_norm_table()`
+
+### 6.1 這一步要做什麼
+
+有了係數，就能在每個月齡（`ages`）算四個參數，夾在和配適時一樣的界限內。
+再從四個參數算百分位：第 $q$ 百分位是同齡孩子有 $q$% 低於它的分數。
+
+### 6.2 公式
+
+$$
+P_q = \mu + \sigma \sinh\!\big((\operatorname{asinh}(\Phi^{-1}(q/100)) - \varepsilon)/\delta\big)
+$$
+
+```latex
+P_q = \mu + \sigma \sinh\!\big((\operatorname{asinh}(\Phi^{-1}(q/100)) - \varepsilon)/\delta\big)
+```
+
+* $\Phi^{-1}$ 是標準常態的分位數（`qnorm()`）。
+* 預設的百分位是 3、5、10、15、25、50、75、85、90、95、97（`NORM_PCT`）。
+
+### 6.3 手算
+
+每個月齡的四個參數：
+
+```{r}
+x_tab <- (sqrt(ages) - best$age_mean) / best$age_sd
+hand_table <- tibble(age_m = ages, mu = poly(best$mu_est, x_tab),
+                     sigma = exp(keep_in(poly(best$sigma_est, x_tab), 10)),
+                     epsilon = keep_in(poly(best$epsilon_est, x_tab), 10),
+                     delta = exp(keep_in(poly(best$delta_est, x_tab), 2)))
+```
+
+第 10、50、90 百分位：
+
+```{r}
+P_q <- function(q, t) t$mu + t$sigma * sinh((asinh(qnorm(q / 100)) - t$epsilon) / t$delta)
+hand_table <- mutate(hand_table, P10 = P_q(10, hand_table), P50 = P_q(50, hand_table),
+                     P90 = P_q(90, hand_table))
+filter(hand_table, age_m %in% c(6, 12, 24, 48, 72))
+```
+
+### 6.4 用 kits
+
+`kits_norm_table()` 是第 3 步：
+
+```{r}
+norm_steps <- kits_norm_table(fit)
+cols <- c("age_m", "mu", "sigma", "epsilon", "delta", "P10", "P50", "P90")
+map_lgl(set_names(cols), \(v) identical(norm_steps[[v]], hand_table[[v]]))
+```
+
+三步接起來，就是 `kits_norms()`；兩者只差記下來的那一行呼叫：
+
+```{r}
+norm <- kits_norms(use$theta, use$age_m, ages)
+identical(without_call(norm), without_call(norm_steps))
+```
+
+`kits_norms(use, ages)` 直接吃分數表也可以：它再記下量尺（`"D"`），之後 `kits_norm_z()` 會檢查分數和常模在同一條量尺上。
+`summary(norm)` 列出常模的檢查：收斂、係數是否碰到界限、最大的 $\delta$、各月齡十分位的同齡 z。
+
+```{r}
+summary(norm)
+```
+
+### 6.5 畫出來
+
+灰色的點是孩子，藍色是 P50，橘色是 P10 和 P90：
+
+```{r, fig.width = 7, fig.height = 4.5}
+curves <- as_tibble(norm) |>
+  select(age_m, P10, P50, P90) |>
+  pivot_longer(-age_m, names_to = "percentile", values_to = "D")
+ggplot(curves, aes(age_m, D)) +
+  geom_point(data = norm_data, aes(age_m, d), colour = "#7F7F7F", alpha = 0.15, size = 0.6) +
+  geom_line(aes(group = percentile, colour = percentile == "P50"), linewidth = 0.8) +
+  scale_colour_manual(values = c(`FALSE` = "#D55E00", `TRUE` = "#0072B2"), guide = "none") +
+  labs(x = "age (months)", y = "D")
+```
+
+### 6.6 教學程式
+
+`norms.R` 的 `data` 段和 `table` 段：
+
+```{r, results = "asis"}
+show_part("norms.R", "data")
+show_part("norms.R", "table")
+```
+
+
+## 7 同齡 z：`kits_norm_z()`、`algo_shash_z()`
+
+### 7.1 這一步要做什麼
+
+同齡 z 說一個孩子在同齡孩子裡的位置：0 是中間，$-1.28$ 大約是第 10 百分位。
+它是百分位公式的反函數：把分數放回標準常態。
+百分等級（PR）是 $100\,\Phi(z)$。
+
+### 7.2 公式
+
+$$
+z = \sinh\!\big(\delta\,\operatorname{asinh}((D - \mu)/\sigma) + \varepsilon\big),\qquad PR = 100\,\Phi(z)
+$$
+
+```latex
+z = \sinh\!\big(\delta\,\operatorname{asinh}((D - \mu)/\sigma) + \varepsilon\big),\qquad PR = 100\,\Phi(z)
+```
+
+* $\mu$、$\sigma$、$\varepsilon$、$\delta$ 是這個孩子月齡的參數。
+* 孩子的月齡在常模表的兩列之間時，四個參數用線性內插。
+* 常模範圍以外的月齡是 NA。
+* 滿分的孩子沒有上限，所以他的 z 沒有意義；自己把它設成 NA。
+
+### 7.3 手算
+
+四個參數在每個孩子的月齡線性內插，再照公式：
+
+```{r}
+at <- function(v) approx(norm$age_m, norm[[v]], use$age_m)$y
+z_hand <- sinh(at("delta") * asinh((use$theta - at("mu")) / at("sigma")) + at("epsilon"))
+c(mean = mean(z_hand), sd = sd(z_hand))
+```
+
+### 7.4 用 kits
+
+`kits_` 這一層：給向量得到 z；給分數表得到多了 `z`、`pct` 兩欄的表。
+
+```{r}
+z_kits <- kits_norm_z(use$theta, use$age_m, norm)
+use_z <- use |>
+  kits_norm_z(norm)
+c(vector = identical(z_kits, z_hand), table = identical(use_z$z, z_hand),
+  pct = identical(use_z$pct, 100 * pnorm(z_hand)))
+```
+
+每個波次的平均接近 0、SD 接近 1，表示常模配得好：
+
+```{r}
+as_tibble(use_z) |>
+  summarise(mean = round(mean(z), 2), sd = round(sd(z), 2), .by = wave_m)
+```
+
+`algo_` 這一層：`algo_shash_z()` 直接在孩子的月齡算多項式，不經過常模表，所以不內插。
+
+```{r}
+z_algo <- best |>
+  algo_shash_z(sqrt(use$age_m), use$theta)
+max(abs(z_algo - z_kits))
+```
+
+差距是半個月一列的線性內插造成的，這裡最多約 `r signif(max(abs(z_algo - z_kits)), 2)`。
+在表上的月齡，兩者相同：
+
+```{r}
+row24 <- filter(as_tibble(norm), age_m == 24)
+z24 <- algo_shash_z(best, sqrt(24), row24$P10)
+c(algo = z24, qnorm = qnorm(0.10), diff = z24 - qnorm(0.10))
+```
+
+### 7.5 教學程式
+
+`norms.R` 的 `z` 段：`approx()` 在常模表的兩列之間線性內插。
+
+```{r, results = "asis"}
+show_part("norms.R", "z")
+```
+
+整份程式在乾淨的環境裡跑一次（約 10 秒），看它自己的 `compare` 段（容許誤差 $10^{-4}$）：
+
+```{r}
+env_norm <- run_script("norms.R")
+env_norm$diffs
+```
+
+`compare` 之後的 `by` 段是分性別的常模（`kits_norms(..., by = data.frame(sex = sex))`）：每一組各配一次，每個孩子放在自己這一組的曲線上。
+
+```{r}
+env_norm$diffs_by
+```
+
+
+## 8 可重現的管線
+
+下面兩段貼進一個新的 R session，只要 `library(kits)`，就得到和這份教學完全相同的常模。
+資料用 base R 的 `subset()`，不用 dplyr。
+
+```{r repro-data, eval = FALSE}
+library(kits)
+lan03 <- subset(kitm03$responses, domain == "lan")
+motor03 <- subset(kitm03$responses, domain == "motor")
+item03 <- kits_item(lan03, scale = "lan M03")
+item_motor <- kits_item(motor03, scale = "motor M03")
+d_link <- kits_linking(list(lan = item03, motor = item_motor), kitm03$anchors)
+persons03 <- unique(lan03[c("visit_id", "cohort", "wave_m", "age_m", "sex")])
+lan <- lan03 |>
+  kits_subj(item03, persons = persons03) |>
+  kits_convert(d_link)
+```
+
+常模：一次呼叫、三步的 `kits_` 管線、`algo_` 的積木。
+
+```{r repro-norm, eval = FALSE}
+screen <- kits_norm_screen(lan)
+use <- lan[screen$normed, ]
+ages <- kits_norm_ages(use)
+norm <- kits_norms(use$theta, use$age_m, ages)
+norm_steps <- kits_norm_data(use$theta, use$age_m, ages) |>
+  kits_norm_fit() |>
+  kits_norm_table()
+z_algo <- algo_shash(sqrt(use$age_m), use$theta, delta0 = 0.5) |>
+  algo_shash_z(sqrt(use$age_m), use$theta)
+```
+
+`algo_shash()` 只用一個起始值；$\delta_0 = 0.5$ 走到最好的解（5.3 節），所以用它就夠。
+它要和 5.3 節的 `fits[[1]]`（$\delta_0 = 0.5$ 的那一次）相同。
+這份教學真的開一個新的 R session（`callr::r()`）跑這兩段，再把結果帶回來比：
+
+```{r}
+code <- unlist(map(c("repro-data", "repro-norm"), knitr::knit_code$get))
+fresh <- callr::r(function(code) {
+  env <- new.env()
+  eval(parse(text = code), envir = env)
+  as.list(env)
+}, args = list(code = code))
+```
+
+```{r}
+c(lan = identical(fresh$lan$theta, lan$theta),
+  screen = identical(fresh$screen$normed, screen$normed),
+  ages = identical(fresh$ages, ages), norm = identical(fresh$norm, norm),
+  steps = identical(without_call(fresh$norm_steps), without_call(norm)),
+  algo = identical(fresh$z_algo, algo_shash_z(fits[[1]], sqrt(use$age_m), use$theta)))
+```
+
+* `norm` 連記下來的呼叫都相同，因為那一行字一樣。
+* 三步的管線和 `kits_norms()` 只差那一行字（`without_call()`）。
+* `algo_` 的積木給同樣的係數和 z，但沒有常模表、界限的檢查和診斷。
+
+
+## 9 整理
+
+| 步驟 | 公式 | `kits_` | `algo_` | 教學程式 |
+|---|---|---|---|---|
+| 篩波次 | $\mathit{floor\_pct}_w \ge \mathit{cut}$ | `kits_norm_screen()` | （計數） | `norm_screen.R` `screen` |
+| 月齡 | $Q_{0.01}$、$Q_{0.99}$，取到半個月 | `kits_norm_ages()` | （分位數） | `ages` |
+| 資料 | 月齡在 `ages` $\pm$ `pad` | `kits_norm_data()` | （篩選） | `norms.R` `data` |
+| shash 的概似 | $\log f$，四個多項式 | `kits_norm_fit()` | `algo_shash()` | `fit` |
+| 常模表 | $P_q$ | `kits_norm_table()` | （多項式） | `table` |
+| 同齡 z | $z = \sinh(\delta\operatorname{asinh}u + \varepsilon)$ | `kits_norm_z()` | `algo_shash_z()` | `z` |
+
+選 `degrees` 和讀診斷：
+
+* 月齡範圍內至少要 $10\sum(\text{degrees} + 1)$ 個人次，不然停下來。
+* 次數太高時，曲線在月齡兩端會失控；看每個波次的同齡 z 平均是不是接近 0（7.4 節）。
+* 診斷也看：同齡 z 按月齡分成十等分，平均超過 0.2，或 SD 在 0.8 到 1.2 以外，就警告。
+
+全部算完的時間：
+
+```{r}
+round(difftime(Sys.time(), t_start, units = "secs"))
+```
+
+**下一步：** [05_checks](05_checks.html)：連結、常模和題目的檢查。
+
+
+## 參考文獻
+
+* Jones, M. C., & Pewsey, A. (2009). Sinh-arcsinh distributions. *Biometrika, 96*(4), 761-780. doi:10.1093/biomet/asp053
+* Lenhard, W., & Lenhard, A. (2021). Improvement of norm score quality via regression-based continuous norming. *Educational and Psychological Measurement, 81*(2), 229-261. doi:10.1177/0013164420928457
+* Lenhard, A., Lenhard, W., & Gary, S. (2018). *Continuous norming (cNORM)*. The Comprehensive R Archive Network. https://CRAN.R-project.org/package=cNORM
+* Kristensen, K. (2026). *RTMB: R bindings for TMB* (R package version 2.0). doi:10.32614/CRAN.package.RTMB
+* R Core Team (2026). *R: A language and environment for statistical computing*. R Foundation for Statistical Computing, Vienna, Austria. https://www.R-project.org/

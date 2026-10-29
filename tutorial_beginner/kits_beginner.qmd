@@ -1,0 +1,833 @@
+---
+title: "kits for beginners: from answers to norms"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    embed-resources: true
+    grid:
+      body-width: 1100px
+---
+
+```{=html}
+<style>.optional { border: 1px solid #ccc; border-radius: 6px; padding: 0.2em 1em 0.6em; background: #f7f7f7; margin: 1.5em 0; }</style>
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", out.width = "100%")
+options(width = 100)
+```
+
+This tutorial is for people who have never used item response theory (IRT).
+It takes one domain of one cohort from the raw answers to a norm.
+Then it joins two cohorts, and two domains, on one scale.
+
+Each section starts with the question it answers.
+Then comes the code.
+Then comes a short note on how to read the result.
+
+There are no formulas here.
+The formulas, and the code behind each step, are in `tutorial_algorithms/`.
+
+**The data are simulated.**
+No row in this tutorial is a real child.
+The demo data were drawn from summaries of the real KIT data, so they look like KIT.
+But every number you see here is made up.
+Do not quote these numbers as KIT results.
+
+
+## 0 Before you start
+
+**Question: what do the data look like?**
+
+Install kits once, then load it with dplyr and purrr every session.
+kits is not on CRAN; you install it from the source file.
+
+```{r install, eval = FALSE}
+install.packages("kits_0.23.0.tar.gz", repos = NULL, type = "source")
+```
+
+```{r load, message = FALSE}
+library(kits)
+library(dplyr)
+library(purrr)
+```
+
+kits comes with two demo data sets: `kitm03` and `kitm36`.
+They are the two KIT cohorts.
+Cohort M03 was first seen at 3 months; cohort M36 at 36 months.
+Each cohort has `r n_distinct(kitm03$responses$subj_id)` simulated children.
+Each has two domains: language (`"lan"`) and motor (`"motor"`).
+
+Each data set is a list of two tables:
+
+* `responses`: the answers.
+* `anchors`: a key that matches some KIT items to items of an international scale (used in section 10).
+
+In `responses`, one row is one child answering one item at one visit.
+
+```{r look}
+kitm03$responses |>
+  head(3)
+```
+
+The columns:
+
+* `visit_id`: one visit, that is one child at one wave, for example `M03_c55df9b_M12`.
+  kits calls this a *person-wave*.
+* `subj_id`: the child, for example `c55df9b` (7 random hex characters, like a short git hash). It is the same at every visit.
+  The name pairs with `item_id`: `subj_id` says who answered, `item_id` says what.
+* `cohort`: `M03` or `M36`.
+* `sex`: `boy` or `girl`.
+* `wave_m`: the planned age of the visit, in months (the *wave*).
+* `age_m`: the real age at the visit, in months. It is close to `wave_m`, but not equal.
+* `item_id`: the item.
+* `item_score`: the score on the item, from 0 to 3.
+* `domain`: `lan` or `motor`.
+
+Now count the children seen at each wave of each cohort.
+
+```{r count-waves}
+visits <- rbind(kitm03$responses, kitm36$responses) |>
+  distinct(cohort, wave_m, visit_id)
+visits |>
+  count(cohort, wave_m)
+```
+
+How to read it:
+M03 has waves from `r min(kitm03$responses$wave_m)` to `r max(kitm03$responses$wave_m)` months.
+M36 has waves from `r min(kitm36$responses$wave_m)` to `r max(kitm36$responses$wave_m)` months.
+Not every child comes to every wave, so the counts differ.
+
+**Waves 60 and 72 of M03 are not observed.**
+The real M03 cohort stops at 48 months.
+In the demo, M03 at 60 and 72 months was simulated from the M36 children of that age.
+These two waves show what a longer follow-up would look like.
+They are not data.
+
+
+## 1 One domain, one cohort: language in M03
+
+**Question: which children answered which items?**
+
+kits works on one domain at a time.
+Keep the language answers of M03.
+`kits_resp()` turns the long table into one row per person-wave and one column per item.
+It also keeps the information of each child (`subj_id`, `sex`, `wave_m`, `age_m`) next to the answers.
+Every later step takes this information from here, so you never align it by hand.
+
+```{r resp}
+resp <- kitm03$responses |>
+  filter(domain == "lan") |>
+  kits_resp()
+resp
+```
+
+How to read it:
+There are `r nrow(resp)` person-waves.
+The second line counts them by wave.
+`Checks: OK` means kits found no problem in the table.
+
+Three words you will see from now on:
+
+* An **item** is one task, for example "says two words together".
+* A **score** is what the child got on the item. KIT items are scored 0, 1, 2 or 3. A higher score is better.
+* An **item pattern** says which items one child actually answered. Most children at a wave answer the same items; kits calls that set the **standard form** of the wave. A child who skipped one item has a slightly different item pattern.
+
+`summary()` lists every item pattern of each wave.
+
+```{r resp-forms}
+summary(resp)
+```
+
+How to read it:
+Form 1 of each wave is the standard form.
+`n` is the number of children who answered it, and `pct` their share of the wave.
+Almost every child answered the standard form.
+The other item patterns are the standard form without one item, for example `without lana05`.
+`n_items` is the number of items in the item pattern.
+
+`plot()` draws the design: which items each wave answered.
+
+```{r resp-plot, fig.height = 5}
+plot(resp)
+```
+
+How to read it:
+Young waves answer easy items; older waves answer harder ones.
+Neighbouring waves share some items.
+These shared items are what lets kits put all waves on one ruler.
+
+
+## 2 The quick way: `kits()`
+
+**Question: can I get the item thresholds and the children's scores in one step?**
+
+Sometimes you only need the scale of one cohort, with no linking.
+Then `kits()` calibrates and scores in one call.
+
+```{r kits-fit}
+fit <- kits(resp)
+fit
+```
+
+How to read it:
+The top part is the item table, as in section 3.
+The `Abilities` line sums up the positions (θ) of the `r nrow(fit$subj)` person-waves.
+Section 5 explains θ.
+The `Checks:` line joins the checks of the items and of the scores.
+Here it counts `r sum(fit$diagnostics$status == "warn")` warnings and `r sum(fit$diagnostics$status == "note")` notes.
+Section 4 explains the item-fit note.
+Section 5 explains the warnings and the other notes.
+
+The scores are in `fit$subj`.
+
+```{r kits-subj}
+fit$subj |>
+  select(visit_id, wave_m, theta, se) |>
+  head(3)
+```
+
+`plot()` draws a Wright map: children on the left, item thresholds on the right.
+
+```{r kits-plot, fig.height = 5}
+plot(fit)
+```
+
+`fit` holds two parts: `fit$item` and `fit$subj`.
+They are the same as the results of `kits_item()` and `kits_subj()`.
+
+```{r kits-parts, message = FALSE}
+item_check <- kits_item(resp)
+identical(coef(fit$item), coef(item_check))
+identical(fit$subj$theta, kits_subj(resp, item_check)$theta)
+```
+
+Both are `TRUE`.
+The rest of this tutorial does the same thing step by step.
+Linking, norms and the D score need the two parts, so there you call `kits_item()` and `kits_subj()`.
+Use `kits()` when you just want the scores of one cohort.
+
+
+## 3 Calibration: how hard is each item?
+
+**Question: where does each item sit on the ruler?**
+
+*Calibration* means estimating how hard each item is, from the answers of all children at once.
+kits uses the partial credit model (PCM), a common IRT model for items scored 0, 1, 2, 3.
+You only give the answers.
+
+```{r item}
+item <- resp |>
+  kits_item()
+item
+```
+
+The *scale* is the ruler.
+Its unit is the **logit**.
+You do not need the definition of a logit; two facts are enough:
+
+* Bigger means harder (for items) or more able (for children).
+* The zero point is arbitrary. Each calibration sets its own zero.
+
+So the name of the scale matters: it says which ruler the numbers are on.
+We did not give a name, so kits made one from the domain and the cohort: `"`r attr(coef(item), "scale")`"`.
+The message above says so.
+To choose the name yourself, write `kits_item(resp, scale = "lan M03")`.
+kits carries this name along to every later result.
+
+Now look at the item table.
+
+```{r item-coef}
+coef(item) |>
+  select(item_id, item_score, thr, thr_se) |>
+  head(6)
+```
+
+How to read it:
+
+* One row is one step of one item. An item scored 0 to 3 has three steps: from 0 to 1, from 1 to 2, from 2 to 3.
+* `thr` (threshold) is the point on the ruler where a child has a 50% chance to reach at least this score.
+* The first step (`item_score` 1) is the *milestone step*. By default kits counts a score of at least 1 as passing the item.
+* `thr_se` is the uncertainty of the threshold. Smaller is more precise.
+
+A picture of one item helps.
+Here are an easy item, a middle item and a hard item.
+
+```{r item-plot, fig.height = 4}
+plot(item, items = c("lana01", "lanc05", "lanb08"))
+```
+
+How to read it:
+Each curve is the chance of one score.
+As you move right on the ruler, low scores become less likely and high scores more likely.
+The curves of the hard item sit further to the right.
+
+The last line of the printout reads `Checks:`.
+kits checks every result by itself: did the estimation converge, are there items no one passed, and so on.
+`Checks: OK` would mean that all checks passed.
+A `note` is for your information; a `warn` needs a look.
+Here the line reports a note; `summary()` shows which check gave it.
+
+```{r item-checks}
+summary(item)
+```
+
+How to read it:
+The first row says the estimation converged.
+The `item fit` row is the note: `r summary(item)$diagnostics |> filter(check == "item fit") |> pull(value)` of `r nrow(item$itemfit)` items fall outside the usual range.
+Section 4 looks at item fit.
+All the other rows are `ok`.
+
+
+::: {.optional}
+### Optional: why CML needs no ability distribution
+
+You can skip this box.
+It touches lightly on how `kits_item()` estimates the items.
+
+kits uses *conditional maximum likelihood* (CML).
+CML looks at each raw score and at all the ways to reach it.
+`kits_esf()` shows this for a few items; here two of them.
+
+```{r esf}
+esf <- item |>
+  kits_esf(items = c("lana01", "lana02"))
+esf
+```
+
+The table lists every raw score `r` the two items can give.
+`gamma` ($\gamma_r$) adds up all the ways to reach that raw score.
+The printout says the key point: θ cancels.
+
+Now take the raw score in the middle.
+
+```{r esf-prob}
+esf$prob |>
+  filter(r == 3)
+```
+
+How to read it:
+`lana01` gets the score `x`, and `lana02` gets the rest.
+So these rows are all the ways to reach this raw score, with their probabilities.
+The probabilities depend only on the item parameters.
+θ is not in them: every child with this raw score has the same chances.
+This is why `kits_item()` assumes no distribution of ability, normal or other.
+So it also works when each wave answers different items.
+
+`plot()` draws the expected score of each item at each raw score.
+Here it is for the standard form of 12 months.
+
+```{r esf-plot, fig.height = 4}
+form12 <- summary(resp)$forms |>
+  filter(wave_m == 12, form == 1)
+items12 <- strsplit(form12$items, ", ")[[1]]
+plot(kits_esf(item, items = items12))
+```
+
+The conditional item fit of section 4 is built on these expected scores.
+The formulas are in `tutorial_algorithms/`: the ESF in `01_calibration`, the item fit in `05_checks`.
+:::
+
+
+## 4 Do the items fit?
+
+**Question: do the answers to each item follow the model?**
+
+The PCM expects children to pass easy items before hard ones.
+*Item fit* checks, item by item, how well the answers follow this.
+`kits_item()` keeps the item fit in `item$itemfit`, one row per item.
+Sort it by outfit, largest first, and show the first rows.
+
+```{r itemfit}
+item$itemfit |>
+  arrange(desc(outfit)) |>
+  head(5)
+```
+
+The plot shows every item, with the acceptable range shaded.
+
+```{r itemfit-plot, fig.height = 4}
+plot(item, type = "fit")
+```
+
+How to read it:
+
+* The fit is *conditional* (`attr(item$itemfit, "type")`): each answer is compared with what is expected given the child's raw score, as in the optional box above. It needs no θ.
+* `infit` and `outfit` are mean squares. Near 1, the answers are as noisy as the model expects. Above 1, there are unexpected answers; below 1, the answers are more regular than expected.
+* The range 0.6 to 1.4 is a rule of thumb, not a test.
+* `flag` sums it up: `underfit` above the range, `overfit` below it, `ok` inside. Here: `underfit` `r sum(item$itemfit$flag == "underfit")`, `overfit` `r sum(item$itemfit$flag == "overfit")`, `ok` `r sum(item$itemfit$flag == "ok")`.
+* The `Item fit:` line of the printout in section 3 counts and names the items outside this range.
+* `pvalue` is the mean score as a share of the maximum; `rir` is the correlation of the item with the rest of the items.
+* Children have fit too: the scores table has the columns `infit`, `outfit` and `flag` (section 5).
+* `kits_itemfit(resp, item)` gives the same table. Give it other data, for example a new wave, to check the same items there.
+
+
+## 5 Scoring: where is each child on the ruler?
+
+**Question: how able is each child at each visit?**
+
+Once the items are on the ruler, each child can be placed on the same ruler.
+This is *scoring*.
+
+```{r subj}
+scores <- resp |>
+  kits_subj(item)
+scores
+```
+
+How to read it:
+
+* One row is one person-wave.
+* **theta** (θ) is the child's position on the ruler, in logits. A child at the same θ as a threshold has a 50% chance of reaching at least that score.
+* **se** (standard error) says how precise θ is. A smaller SE means a more precise position. Roughly, the true position lies within 2 SE of θ.
+* Children with the same item pattern and the same total score get the same θ.
+* `flag` marks children who got 0 on every item (`zero`) or the full score (`perfect`). Their θ is less certain. `misfit` marks children whose answers do not follow the usual easy-to-hard pattern: their `infit` or `outfit` is above 2 (Linacre's rule: such answers distort the measurement). For example, a child who misses middle items but scores on the hardest one.
+
+The method is called WLE; you do not need it now.
+
+The last line says the scores have warnings.
+`summary()` lists all checks; keep the ones that are not `ok`.
+
+```{r subj-checks}
+summary(scores)$diagnostics |>
+  filter(status != "ok") |>
+  select(status, check, value)
+```
+
+How to read it:
+The *reliability* of a wave says how well its scores separate the children (1 is best).
+It is below 0 at 3 and 6 months.
+The items of these waves are too hard for many children: at 3 months,
+`r sum(scores$wave_m == 3 & scores$flag == "zero")` of `r sum(scores$wave_m == 3)` children
+got 0 on every item.
+The `misfit` note says that `r round(100 * mean(scores$flag == "misfit"))`% of the person-waves are flagged `misfit`.
+
+Now look at how children grow.
+Average θ and SE at each wave.
+
+```{r subj-waves}
+scores |>
+  summarise(
+    n = n(),
+    theta = round(mean(theta), 2),
+    se = round(mean(se), 2),
+    .by = wave_m
+  )
+```
+
+How to read it:
+Mean θ rises with age: fast in the first two years, slower later.
+SE is largest at 3 months, where many children got 0 on every item.
+It is larger again at 60 and 72 months, where more children got the full score.
+
+Children and items are now on one ruler.
+A *Wright map* shows both: children on one side, item thresholds on the other.
+
+```{r wright, fig.height = 5}
+plot(item, type = "wright", scores = scores)
+```
+
+How to read it:
+An item next to many children is well matched to them.
+Items far above all children, or far below, tell you little about them.
+
+
+## 6 Raw score table
+
+**Question: at a visit, which θ goes with each raw score?**
+
+At a visit, the tester adds up the scores.
+This sum is the *raw score*.
+The raw score table gives the θ and SE for each raw score of each wave's standard form.
+
+```{r subj-table}
+raw_table <- scores |>
+  kits_subj_table()
+raw_table |>
+  filter(wave_m == 12) |>
+  select(wave_m, raw, theta, se, n)
+```
+
+How to read it:
+
+* One row is one raw score on the standard form of one wave.
+* `n` is how many children in the data had that raw score.
+* The same raw score at two waves gives two different θ, because the items differ.
+* Children who skipped an item are not in this table. Their θ comes from `kits_subj()`.
+
+Without data, `kits_subj_table(item)` lists every raw score of every item pattern.
+Use it to print a table for testers.
+
+
+## 7 Norms: where does a child stand among children of the same age?
+
+**Question: is this child ahead of, or behind, children of the same age?**
+
+A **norm** describes the scores of children at each age.
+Its **percentiles** are cut points.
+P50 is the middle: half of the children of that age score below it.
+P3 is low: only 3% score below it.
+P97 is high: 97% score below it.
+
+First, check which waves can enter a norm.
+A wave where many children got the lowest score cannot show who is behind.
+`kits_norm_screen()` leaves out waves with 20% or more at the lowest score.
+
+```{r norm-screen}
+screen <- scores |>
+  kits_norm_screen()
+screen
+```
+
+How to read it:
+At 3 months, `r screen$waves$floor_pct[screen$waves$wave_m == 3]`% of the children got the lowest score.
+So wave 3 is left out (`normed` is `FALSE`).
+
+Keep the person-waves that pass the screen.
+
+```{r norm-keep}
+normed <- scores |>
+  filter(screen$normed)
+```
+
+kits fits a smooth curve for each percentile, from P3 to P97, across age.
+Here it fits one norm for boys and one for girls.
+The age range is chosen from the data and printed.
+
+```{r norms}
+norms <- normed |>
+  kits_norms(by = "sex")
+print(norms, n = 3)
+```
+
+How to read it:
+The message says the norms are in logits, on the ruler `"lan M03"`, not in D (section 10).
+A norm in logits is fine for learning.
+The second line of the printout gives the ages the norm was fitted on, and says that there is
+one norm per sex.
+One row is one sex at one age, every half month.
+`mu`, `sigma`, `epsilon` and `delta` describe the shape of the scores at that age.
+You can skip them; the percentiles are what you use.
+
+Look at a few ages.
+
+```{r norms-ages}
+norms |>
+  filter(age_m %in% c(6, 12, 24, 36, 48)) |>
+  select(sex, age_m, P3, P50, P97)
+```
+
+The header still gives the ages the norm was fitted on.
+`showing 10 rows` says that only the rows you kept are printed.
+
+```{r norms-plot, fig.height = 5}
+plot(norms, scores = normed)
+```
+
+How to read it:
+The curves rise fast early and flatten later, like the wave means in section 5.
+The children should spread around the curves: about 3% below P3 and about 3% above P97.
+
+Now compare each child with the norm.
+The **z score** says how many standard deviations a child is above (+) or below (−) children of the same age and sex.
+The **percentile rank** (`pct`) says what share of those children score lower.
+z = 0 is the middle (50%); z = −2 is low (about 2%).
+
+```{r norm-z}
+scores_z <- scores |>
+  kits_norm_z(norms)
+scores_z |>
+  filter(!is.na(z)) |>
+  summarise(mean = round(mean(z), 2), sd = round(sd(z), 2), .by = wave_m)
+```
+
+How to read it:
+At each wave, mean z should be close to 0 and SD close to 1.
+If so, the norm fits the children it was made from.
+Children outside the age range of the norm get `NA`.
+Here that is wave 3, which the screen left out.
+
+Now follow one child across visits.
+
+```{r norm-z-child}
+scores_z |>
+  filter(subj_id == "c55df9b") |>
+  select(wave_m, age_m, theta, flag, z, pct)
+```
+
+How to read it:
+θ rises over the years, because the child grows.
+It does not rise at every visit: each θ has an SE, so a small step down can be noise.
+z stays near 0 at most visits: the child keeps its place among children of the same age.
+At 60 months this child got the full score (`perfect`).
+Its θ is high but uncertain, so z jumps up for one visit.
+A lasting drop in z would mean the child grows more slowly than its peers.
+
+Remember: these norms come from simulated children, and waves 60 and 72 are not observed.
+They show the method, not KIT norms.
+
+
+## 8 At what age do children pass each item?
+
+**Question: at what age do half of the children pass each item?**
+
+`kits_item_table()` fits, for each item, how the chance of passing rises with age.
+It reports the age at which half of the children pass (`age50`).
+It also places each item on a norm, so it needs a norm with one curve for all children.
+`D` is the threshold of the item's first step (passing), here still in logits on `"lan M03"`.
+
+```{r age-pass}
+norm_all <- normed |>
+  kits_norms()
+item_tab <- kits_item_table(item, norm_all, data = resp)
+item_tab |>
+  select(item_id, D, age50) |>
+  arrange(D)
+```
+
+How to read it:
+`age50` is in months.
+It is `NA` when, within the ages seen, the pass rate never crosses one half.
+Here that happens to the items first given at 36 months: most children pass them already at their first visit.
+
+The rows are ordered by threshold, so you can compare the two orders: by threshold and by age.
+Harder items (larger `D`) are passed later (larger `age50`).
+The correlation of the two orders is
+`r round(cor(item_tab$D, item_tab$age50, use = "complete.obs"), 2)`.
+An item out of line deserves a closer look.
+
+`plot()` puts each item on the growth curves of the norm, at its `D` and its `age50`.
+
+```{r age-pass-plot, fig.height = 5}
+plot(item_tab)
+```
+
+
+## 9 Two cohorts on one ruler
+
+**Question: can M36 children be compared with M03 children?**
+
+So far everything is on the ruler `"lan M03"`.
+If you calibrate M36 by itself, you get another ruler, `"lan M36"`, with its own zero.
+A θ of 1 on one ruler is not a θ of 1 on the other.
+**Linking** finds the rule that moves numbers from one ruler to the other.
+
+First, do sections 1, 3 and 5 for M36.
+
+```{r m36}
+resp36 <- kitm36$responses |>
+  filter(domain == "lan") |>
+  kits_resp()
+item36 <- kits_item(resp36)
+scores36 <- kits_subj(resp36, item36)
+```
+
+Some items were answered in both cohorts.
+These *common items* have a threshold on each ruler.
+kits draws a straight line through these pairs:
+
+θ on M03 = intercept + slope × θ on M36
+
+```{r link}
+co <- kits_linking(item36, item)
+co
+```
+
+How to read it:
+
+* `scales: lan M36 -> lan M03` says the direction. Check it: the reverse is also a valid link.
+* `intercept` and `slope` are the line: here intercept = `r round(co$intercept, 2)` and
+  slope = `r round(co$slope, 2)`.
+* Many books (Kolen & Brennan) write the line as A × θ + B, with A the slope.
+  kits 0.22 and earlier called the intercept `a` and the slope `b`.
+* `points` counts the common item steps used (`r co$n` here).
+* `dropped` lists the steps that were far off the line and left out (`r length(co$dropped)` here).
+
+```{r link-plot, fig.height = 4.5}
+plot(co)
+```
+
+Now move the M36 scores to the M03 ruler.
+
+```{r convert}
+scores36_03 <- scores36 |>
+  kits_convert(co)
+print(scores36_03, n = 3)
+```
+
+The column is still called `theta`.
+Only the ruler changed; the printout and `attr(, "scale")` say which.
+
+The two cohorts overlap from 36 to 72 months.
+If the link works, children of the same age should have about the same mean in both cohorts.
+Stack the two tables with `rbind()`.
+
+```{r overlap}
+both <- rbind(scores, scores36_03)
+both |>
+  filter(wave_m %in% c(36, 48, 60, 72)) |>
+  summarise(theta = round(mean(theta), 2), .by = c(wave_m, cohort)) |>
+  arrange(wave_m)
+```
+
+How to read it:
+At 36 and 48 months the two means are close.
+Both cohorts were observed at these ages, so 36 and 48 are the fair check.
+At 60 and 72, M03 was simulated from M36, so these rows do not test the link.
+
+kits refuses to stack tables on different rulers.
+If you forget `kits_convert()`, `rbind()` stops with an error.
+This is on purpose.
+
+```{r rbind-error, error = TRUE}
+rbind(scores, scores36)
+```
+
+`kits_vertical()` sums up each cohort at each wave.
+Its plot shows the two cohorts on one ruler.
+
+```{r vertical, fig.height = 4.5}
+plot(kits_vertical(both), type = "median")
+```
+
+How to read it:
+Each point is the median θ of one cohort at one wave; the bar runs from P25 to P75.
+Where the cohorts overlap, their points should nearly meet.
+The line goes on to 96 months with M36 alone.
+
+
+## 10 Two domains, and the D score
+
+**Question: how do we report language and motor on one international scale?**
+
+So far you did one domain step by step.
+Now do language and motor together.
+`purrr::map()` runs the same steps for each domain; `list_rbind()` stacks the results.
+
+```{r domains-items}
+resps <- c("lan", "motor") |>
+  set_names() |>
+  map(\(d) kits_resp(filter(kitm03$responses, domain == d)))
+items <- resps |>
+  map(kits_item)
+```
+
+The **D score** is the developmental score of the GSED (Global Scales for Early Development), from the WHO.
+Its unit is D.
+Putting KIT on D lets KIT be compared with other countries.
+
+Some KIT items are the same as GSED items.
+These are the **anchor items**.
+Each has a known GSED difficulty, `tau`, in D.
+The key is already in the data: `kitm03$anchors`.
+
+```{r anchors}
+used <- kitm03$responses |>
+  distinct(item_id, domain)
+n_anchors <- kitm03$anchors |>
+  semi_join(used, by = c("item_id", "domain")) |>
+  count(domain)
+n_anchors
+```
+
+How to read it:
+In M03, motor has `r n_anchors$n[n_anchors$domain == "motor"]` anchors
+and language only `r n_anchors$n[n_anchors$domain == "lan"]`.
+A link needs at least 3 anchors.
+So language cannot be linked to D on its own:
+
+```{r d-link-lan, error = TRUE}
+kits_linking(items$lan, kitm03$anchors)
+```
+
+This is one reason to link the domains together, with one shared line.
+Give `kits_linking()` the named list of both calibrations.
+
+```{r d-link}
+d_link <- kits_linking(items, kitm03$anchors)
+d_link
+```
+
+How to read it:
+
+* D = intercept + slope × θ, with θ on each domain's M03 ruler.
+  Here intercept = `r round(d_link$intercept, 1)` and slope = `r round(d_link$slope, 1)`.
+* `kept points by domain` shows that most anchors come from motor.
+* The domain check fits each domain its own intercept, as a check.
+* The intercepts (`r round(d_link$domains$intercept, 1)`) are close to the shared `intercept`, so one line for both domains is reasonable.
+
+Now score both domains and convert to D.
+
+```{r d-scores}
+d_scores <- map2(resps, items, kits_subj) |>
+  map(\(s) kits_convert(s, d_link)) |>
+  list_rbind(names_to = "domain")
+print(d_scores, n = 3)
+```
+
+The scale is now `D` for both domains.
+Put the mean D of each domain at each wave in one table.
+
+```{r d-table}
+d_scores |>
+  summarise(D = round(mean(theta), 1), .by = c(wave_m, domain)) |>
+  tidyr::pivot_wider(names_from = domain, values_from = D)
+```
+
+How to read it:
+Both domains are now in D, so their means can sit in one table.
+D rises with age in both domains.
+
+M36 reaches D through two links: first `co` (M36 to M03), then `d_link` (M03 to D).
+Give both links to `kits_convert()`, in the order they apply.
+
+```{r d-m36}
+scores36_d <- scores36 |>
+  kits_convert(co, d_link)
+scores36_d |>
+  summarise(D = round(mean(theta), 1), .by = wave_m) |>
+  arrange(wave_m)
+```
+
+How to read it:
+At 36 and 48 months, M36 language should be close to M03 language in the table above.
+After 72 months, only M36 goes on.
+
+
+## 11 Next steps
+
+* **Real KIT data**: `tutorial_kit/`. Same steps, with the real response files, norm screening and more checks.
+* **Formulas and code**: `tutorial_algorithms/`, in six parts (calibration, scoring, linking, norms, checks, scale). Each step written as a formula, as code, and checked by hand. `kits_algorithm(x)` says how any result `x` was made: its steps, formulas, functions and references.
+* **Other packages**: `tutorial_compare/` compares kits with TAM. kitsPreview runs the same steps with dexter or immer.
+* **More in kits**: `vignette("kits-flow", package = "kits")` and `vignette("kits-advanced", package = "kits")` cover item fit, DIF, linking error, new waves and the checks (`kits_check()`, `kits_info()`).
+
+
+## Words used in this tutorial
+
+| Word | Plain meaning |
+|---|---|
+| Item | One task the child is asked to do. |
+| Score | What the child got on one item: 0, 1, 2, ... |
+| Raw score | The sum of the item scores of one visit. |
+| Item pattern | Which items one child answered at one visit. |
+| Standard form | The item pattern most children of a wave answered. |
+| Person-wave, visit | One child at one wave (`visit_id`). |
+| Calibration | Estimating how hard each item is, from all answers at once. |
+| Scale, ruler | The line on which items and children are placed. It has a name, like `"lan M03"`. |
+| Logit | The unit of a calibrated scale. Its zero is arbitrary. |
+| Threshold (`thr`) | The point on the ruler where a child has a 50% chance to reach at least this score. |
+| Item fit (infit, outfit) | How well the answers to an item follow the model. Near 1 is good. |
+| θ (theta) | A child's position on the ruler. |
+| SE | How precise a θ or a threshold is. Smaller is more precise. |
+| Reliability | How well the scores of a wave separate the children. 1 is best. |
+| Age at 50% passing (`p50`) | The age at which half of the children pass an item. |
+| Norm | The spread of scores of children at each age. |
+| Percentile (P3 ... P97) | The score below which 3%, ..., 97% of same-age children fall. |
+| z score | How many SDs a child is above or below same-age children. |
+| Percentile rank (`pct`) | The share of same-age children who score lower. |
+| Common items | Items answered in both cohorts. |
+| Linking | Finding the straight line that moves numbers from one ruler to another. |
+| Anchor items | KIT items that are also GSED items, with a known difficulty in D. |
+| D score | The GSED developmental scale. Its unit is D. |

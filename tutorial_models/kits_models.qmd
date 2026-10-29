@@ -1,0 +1,1084 @@
+---
+title: "kits 的模型：寫一次，導數交給 RTMB"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-title: 目錄
+    embed-resources: true
+    self-contained-math: true
+    grid:
+      body-width: 1000px
+knitr:
+  opts_chunk:
+    collapse: true
+    comment: "#>"
+---
+
+```{=html}
+<style>
+.MathJax_Display, mjx-container { overflow-x: auto; overflow-y: hidden; }
+pre code { white-space: pre; }
+</style>
+```
+
+```{r setup, include = FALSE}
+options(width = 100)
+library(kits)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+t_start <- Sys.time()
+```
+
+## 0 這份教學在講什麼
+
+kits `r packageVersion("kits")` 的每個估計都是一個模型。
+kits 只寫模型本身：概似、門檻的方程式、訊息函數。
+導數一個也不手推。
+梯度、Hessian、牛頓法、隱函數的導數，都交給 RTMB 的自動微分。
+這就是「模型寫一次，導數由 RTMB 給」。
+
+這有兩個好處。
+第一，公式只有一份，程式和公式可以一行一行對著讀。
+第二，手推的導數容易錯，也容易和模型不同步；自動微分不會。
+
+這份教學一節講一個模型。
+每一節有四個部分：
+
+1. 公式：模型的數學式。
+2. 程式：套件裡真正的程式。
+   這些程式在產生這份文件時，從 `kits/R/` 的原始檔讀進來。
+   所以文件和程式不會不同步。
+3. RTMB 做什麼：兩到四句話。
+4. 對答案：一個小例子，在示範資料或模擬資料上算一次，和另一種算法比。
+
+示範資料是套件附的 `kitm03`、`kitm36`。
+其他都是模擬資料。
+輸出裡沒有任何人的編號。
+
+```{r, eval = FALSE}
+library(kits)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+```
+
+### 0.1 讀原始檔的小工具
+
+第一個函數找出一個函數在檔案裡的行。
+它用 `parse(keep.source = TRUE)` 解析整個檔案，再看每個運算式的 `srcref`。
+
+```{r}
+src_dir <- file.path("..", "kits", "R")
+
+fun_range <- function(file, name) {
+  exprs <- parse(file.path(src_dir, file), keep.source = TRUE)
+  defined <- map_chr(as.list(exprs), \(e) if (is.call(e)) deparse(e[[2]])[1] else "")
+  ref <- attr(exprs, "srcref")[[match(name, defined)]]
+  c(first = with_comments(file, ref[1]), body = ref[1], last = ref[3])
+}
+```
+
+函數上面連著的註解也算進來（`#` 開頭；不含 roxygen 的 `#'`）。
+
+```{r}
+with_comments <- function(file, first) {
+  lines <- readLines(file.path(src_dir, file))
+  while (first > 1 && grepl("^#(\\s|$)", lines[first - 1])) first <- first - 1
+  first
+}
+```
+
+第二個函數把找到的行印成 R 的程式區塊（區塊選項 `output: asis`）。
+
+```{r}
+show_code <- function(file, names) {
+  lines <- readLines(file.path(src_dir, file))
+  for (name in names) {
+    r <- fun_range(file, name)
+    cat(sprintf("\n```r\n# kits/R/%s，第 %d–%d 行\n", file, r[["first"]], r[["last"]]))
+    cat(lines[r[["first"]]:r[["last"]]], sep = "\n")
+    cat("```\n\n")
+  }
+}
+```
+
+對答案時，把每一個差距記下來，最後一起列表（第 10 節）。
+
+```{r}
+checks <- tibble(section = character(), check = character(), max_diff = numeric())
+record <- function(section, check, diff) {
+  checks <<- add_row(checks, section = section, check = check, max_diff = max(abs(diff)))
+  max(abs(diff))
+}
+```
+
+### 0.2 模型一覽
+
+```{r}
+models <- tribble(
+  ~section, ~model, ~file, ~funs,
+  "1", "PCM 核心", "pcm_core.R", c("pcm_kernel", "pcm_kernel_ad", "is_ad", "row_sum"),
+  "1", "PCM 的動差", "algo.R", "algo_pcm",
+  "2", "CML", "cml.R", c("cml_nll", "cml_centre", "cml_gamma_matrix", "times_item_poly"),
+  "2", "CML（多項式）", "pcm_core.R", c("poly_times", "shift_cols"),
+  "3", "最佳化", "cml.R", "fit_ad",
+  "4", "WLE", "ability.R", c("wle_setup", "wle_parts", "wle_solve"),
+  "4", "WLE（Jeffreys 眾數估計）", "algo.R", "algo_jme",
+  "5", "門檻的 SE", "calibrate.R",
+  c("p_at_least", "step_threshold", "threshold_jacobian", "step_thresholds"),
+  "6", "ESF", "algo.R", "algo_esf",
+  "7", "同齡組的潛在常態", "link_check.R", "latent_normal",
+  "8", "shash 常模", "norms_shash.R", c("ad_clamp", "shash_link"),
+  "8", "shash 常模（概似）", "algo.R", "algo_shash",
+  "9", "訊息的斜率", "pcm_core.R", "information_slope",
+  "9", "GK gamma 的 SE", "restscore.R", "gk_gamma"
+)
+```
+
+每個函數的行數也從原始檔算：程式的行，和上面的註解行。
+
+```{r}
+count_lines <- function(file, funs) {
+  r <- map(funs, \(f) fun_range(file, f))
+  c(code = sum(map_dbl(r, \(x) x[["last"]] - x[["body"]] + 1)),
+    comment = sum(map_dbl(r, \(x) x[["body"]] - x[["first"]])))
+}
+models <- models |>
+  mutate(n = map2(file, funs, count_lines), code = map_dbl(n, "code"),
+         comment = map_dbl(n, "comment"))
+```
+
+每個模型寫了什麼，RTMB 給了什麼：
+
+```{r}
+models |>
+  mutate(written = c("eta、log S", "P、E、Var", "-log L（gamma 是多項式的係數）", "多項式相乘",
+                     "（呼叫 RTMB）", "f = log L + 1/2 log I", "SE = sqrt(I + (I'/2I)^2) / I",
+                     "sum_k (P(X >= k) - rp)^2", "gamma、P(X = x | r)", "-log L（格點積分）",
+                     "參數的多項式和界", "-log f（shash）", "I(theta)", "gamma = (C - D) / (C + D)"),
+         rtmb = c("logspace_add()、advector 的路", "（數值和 advector 同一段）",
+                  "MakeADFun()：梯度；ADoverload()", "（錄進 CML 的 tape）",
+                  "nlminb + 牛頓步（$gr、$he）", "MakeTape、$newton()", "I' 用 $jacobian()",
+                  "$newton() 再 $jacobian()", "（和 CML 同一段程式）",
+                  "MakeADFun、ADREPORT、sdreport", "（錄進 shash 的 tape）", "MakeADFun：梯度",
+                  "$jacobian()", "$jacobian()：d gamma / d n")) |>
+  transmute(節 = section, 模型 = model, 檔案 = file, 函數 = map_chr(funs, toString),
+            程式行 = code, 註解行 = comment, 寫的是 = written, RTMB給的 = rtmb) |>
+  mutate(across(where(is.character), \(x) gsub("$", "\\$", x, fixed = TRUE))) |>
+  knitr::kable()
+```
+
+```{r}
+total_code <- sum(models$code)
+total_comment <- sum(models$comment)
+```
+
+這些模型的程式加起來 `r total_code` 行，註解 `r total_comment` 行。
+其中最長的是 shash 常模的 `algo_shash()`：大部分是 cNORM 的界、起始值和收斂的判斷，概似本身只有十來行。
+導數的程式：0 行。
+
+
+## 1 PCM 核心
+
+### 公式
+
+部分給分模型（PCM；Masters, 1982）。
+第 $i$ 題有 $m_i$ 個步驟，步驟參數 $\beta_{i1}, \dots, \beta_{im_i}$。
+
+$$
+\eta_{ik}(\theta) = \sum_{g=1}^{k} (\theta - \beta_{ig}), \qquad \eta_{i0} = 0
+$$
+
+$$
+P(X_i = k \mid \theta) = \frac{\exp \eta_{ik}}{S_i(\theta)}, \qquad
+S_i(\theta) = \sum_{h=0}^{m_i} \exp \eta_{ih}
+$$
+
+$$
+E_i(\theta) = \sum_k k \, P_{ik}, \qquad
+\mathrm{Var}_i(\theta) = \sum_k (k - E_i)^2 P_{ik}, \qquad
+M_{3,i}(\theta) = \sum_k (k - E_i)^3 P_{ik}
+$$
+
+$\mathrm{Var}_i$ 就是第 $i$ 題的訊息。
+這三個量之間有兩個恆等式，等一下拿來對答案：
+
+$$
+\frac{d}{d\theta} \log S_i(\theta) = E_i(\theta), \qquad
+\frac{d}{d\theta} E_i(\theta) = \mathrm{Var}_i(\theta)
+$$
+
+### 程式
+
+```{r}
+#| output: asis
+show_code("pcm_core.R", c("pcm_kernel", "pcm_kernel_ad", "is_ad", "row_sum"))
+show_code("algo.R", "algo_pcm")
+```
+
+### RTMB 做什麼
+
+輸入是數值時，走 `pcm_kernel()` 原來的路：每列減掉最大值再取 exp，數字一個位元都不變。
+輸入是 RTMB 的 advector（正在錄 tape）時，走 `pcm_kernel_ad()`。
+RTMB 不能對「比大小」微分，所以不減最大值，改用 `logspace_add()` 逐欄累加 $\log S$；這樣一樣不會溢位。
+`row_sum()` 用矩陣乘法代替 `rowSums()`，因為 advector 不能用 `rowSums()`。
+
+### 對答案
+
+一題三個步驟，13 個 theta。
+
+```{r}
+beta_i <- c(-1, 0.3, 1.2)
+theta <- seq(-3, 3, by = 0.5)
+num <- kits:::pcm_kernel(theta, beta_i)
+mom <- algo_pcm(theta, beta_i)
+```
+
+把 $\log S$ 錄成 tape：tape 裡走的是 `pcm_kernel_ad()`。
+它的值和數值的路相同。
+
+```{r}
+tape_log_S <- RTMB::MakeTape(\(t) kits:::pcm_kernel(t, beta_i)$log_S, theta)
+record("1", "log S：advector 的路 vs 數值的路", tape_log_S(theta) - num$log_S)
+```
+
+$\log S$ 的導數是 $E$。
+每個 $\log S$ 只和自己的 theta 有關，所以 `sum()` 的 jacobian 就是每個 theta 的導數。
+
+```{r}
+d_log_S <- RTMB::MakeTape(\(t) sum(kits:::pcm_kernel(t, beta_i)$log_S), theta)
+record("1", "d log S / d theta vs E", drop(d_log_S$jacobian(theta)) - mom$E)
+```
+
+$E$ 的導數是 $\mathrm{Var}$（題目訊息）。
+
+```{r}
+d_E <- RTMB::MakeTape(\(t) sum(algo_pcm(t, beta_i)$E), theta)
+record("1", "d E / d theta vs Var", drop(d_E$jacobian(theta)) - mom$Var)
+```
+
+差距都在 1e-15 左右：捨入誤差。
+
+
+## 2 CML：條件最大概似
+
+### 公式
+
+原始分 $r$ 是 theta 的充分統計量。
+給定原始分，作答型態的機率和 theta 無關：
+
+$$
+P(\mathbf{x} \mid r) = \frac{\exp\left(-\sum_i \sum_{g \le x_i} \beta_{ig}\right)}{\gamma_r}
+$$
+
+$\gamma_r$ 是基本對稱函數（elementary symmetric function）。
+它是一個多項式乘積的係數：
+
+$$
+\gamma_r = [z^r] \prod_i \left(1 + e_{i1} z + e_{i2} z^2 + \dots + e_{im_i} z^{m_i}\right),
+\qquad e_{ik} = \exp\left(-\sum_{g \le k} \beta_{ig}\right)
+$$
+
+$n_{ig}$ 是這一題得到 $g$ 分以上的人數，$n_{br}$ 是題本 $b$ 原始分 $r$ 的人數。
+
+$$
+-\log L = \sum_{i,g} \beta_{ig} \, n_{ig} + \sum_b \sum_r n_{br} \log \gamma_{br}
+$$
+
+長的題本，$\gamma_r$ 會下溢或上溢。
+所以每個題本先把 beta 減掉它的平均 $c_b$，再乘回來（數學上完全相同）：
+
+$$
+\gamma_r(\beta) = e^{-r c_b} \, \gamma_r(\beta - c_b)
+$$
+
+原點：所有 beta 的和是 0，寫成 $\beta = \beta_0 + A b$，只估 $b$。
+
+### 程式
+
+```{r}
+#| output: asis
+show_code("cml.R", c("cml_nll", "cml_centre", "cml_gamma_matrix", "times_item_poly"))
+show_code("pcm_core.R", c("poly_times", "shift_cols"))
+```
+
+### RTMB 做什麼
+
+`cml_nll()` 只寫 $-\log L$。
+`RTMB::MakeADFun()` 把它錄成 tape，給出 `obj$fn`、梯度 `obj$gr` 和 Hessian `obj$he`。
+`cml_gamma_matrix()` 把 advector 放進數值矩陣 `G`，這要 `RTMB::ADoverload("[<-")` 明說。
+多項式相乘的 `poly_times()` 是普通的 R 程式；RTMB 錄下每一個加法和乘法。
+
+### 對答案
+
+先看多項式相乘：$(1 + 2z)(1 + 3z) = 1 + 5z + 6z^2$。
+
+```{r}
+kits:::poly_times(matrix(c(1, 2), nrow = 1), list(1, 3))
+```
+
+模擬五題、400 人；前 100 人沒答第 5 題，所以有兩個題本。
+
+```{r}
+betas <- list(a1 = c(-1, 0), a2 = c(0, 1), a3 = 0.5, a4 = -0.5, a5 = c(-0.5, 0.8))
+set.seed(1)
+X <- kits_sim(rnorm(400), betas, seed = 1)
+X[1:100, "a5"] <- NA
+item_sim <- kits_item(X)
+```
+
+用校準留下的充分統計量，做出同一個 $-\log L$，再交給 RTMB。
+
+```{r}
+inp <- kits:::cml_inputs(item_sim$stats)
+con <- kits:::cml_constraint(inp, NULL)
+nll <- kits:::cml_nll(inp, con)
+obj <- RTMB::MakeADFun(nll, list(b = numeric(ncol(con$A))), silent = TRUE)
+length(obj$par)
+```
+
+在任意一點，RTMB 的梯度和中央差分比。
+
+```{r}
+central_diff <- function(f, p, h = 1e-5) {
+  map_dbl(seq_along(p), \(j) {
+    e <- replace(numeric(length(p)), j, h)
+    (f(p + e) - f(p - e)) / (2 * h)
+  })
+}
+```
+
+```{r}
+p <- seq(-0.5, 0.5, length.out = length(obj$par))
+record("2", "CML 梯度：RTMB vs 中央差分", obj$gr(p) - central_diff(obj$fn, p))
+```
+
+差距是 1e-8 左右：這是中央差分本身的誤差（$h^2$ 和捨入），不是 RTMB 的。
+
+
+## 3 一個最佳化：`fit_ad()`
+
+### 公式
+
+CML 和第 7 節的潛在常態都用同一個最佳化。
+先用梯度走準牛頓法（`nlminb`），再用精確的 Hessian 走幾步牛頓法：
+
+$$
+b^{(t+1)} = b^{(t)} - H(b^{(t)})^{-1} \, g(b^{(t)})
+$$
+
+最後一點的 Hessian 的反矩陣就是共變異矩陣：
+
+$$
+\widehat{\mathrm{Var}}(\hat\beta) = A \, H^{-1} A^\top
+$$
+
+### 程式
+
+```{r}
+#| output: asis
+show_code("cml.R", "fit_ad")
+```
+
+### RTMB 做什麼
+
+`obj$gr` 和 `obj$he` 都由 RTMB 自動微分。
+`nlminb` 在很嚴的容許誤差下常提早停，回傳的代碼不是 0；精確 Hessian 的牛頓步才走到最大值。
+Hessian 最花時間，所以只算幾次。
+
+### 對答案
+
+用第 2 節的 `obj`。
+
+```{r}
+fit <- kits:::fit_ad(obj)
+fit[c("convergence", "message", "max_gradient", "hessian_pd")]
+```
+
+`nlminb` 自己沒有宣告收斂（代碼 `r fit$convergence`，訊息「`r fit$message`」）。
+但牛頓步之後，最大梯度是 `r format(signif(fit$max_gradient, 2))`，Hessian 正定：已經在最大值。
+
+估計值和 `kits_item()` 的完全相同（這就是它用的程式）。
+
+```{r}
+beta_hat <- drop(con$beta0 + con$A %*% fit$par)
+record("3", "beta：fit_ad() vs kits_item()", beta_hat - item_sim$fit$coef$beta)
+```
+
+RTMB 的 Hessian 和梯度的中央差分比。
+
+```{r}
+H_cd <- map(seq_along(fit$par), \(j) central_diff(\(q) obj$gr(q)[j], fit$par)) |>
+  do.call(what = rbind)
+record("3", "CML Hessian：RTMB vs 梯度的中央差分", fit$hessian - H_cd)
+```
+
+SE 是 $A H^{-1} A^\top$ 的對角線開根號，和 `kits_item()` 的 `SE_beta` 相同。
+
+```{r}
+V <- con$A %*% solve(fit$hessian) %*% t(con$A)
+record("3", "SE_beta：A H^-1 A' vs kits_item()", sqrt(diag(V)) - item_sim$fit$coef$SE_beta)
+```
+
+
+## 4 WLE：加權概似估計
+
+### 公式
+
+Warm（1989）的 WLE 最大化加權概似：
+
+$$
+f(\theta) = \log L(\theta) + \tfrac{1}{2} \log I(\theta), \qquad
+\log L(\theta) = r\theta - \sum_i \log S_i(\theta), \qquad
+I(\theta) = \sum_i \mathrm{Var}_i(\theta)
+$$
+
+$\log S_i$ 和 $\mathrm{Var}_i$ 來自第 1 節的核心。
+原始分是充分統計量，所以 WLE 只和「題目組合 × 原始分」有關。
+起始值和 TAM 相同：
+
+$$
+\theta_0 = \bar\beta + \log \frac{r + 0.5}{R - r + 1}
+$$
+
+$\bar\beta$ 是這組題的步驟參數的平均，$R$ 是滿分。
+kits 叫它 WLE。
+對 PCM，WLE 和 Jeffreys 眾數估計（$\log L + \tfrac{1}{2}\log I$ 的最大值）相同，kits 算的是後者（Firth, 1993; Magis, 2015），函數是 `algo_jme()`。
+SE 用 Warm 的公式：
+
+$$
+\mathrm{SE}(\hat\theta) = \frac{\sqrt{I + \left(I' / 2I\right)^2}}{I}, \qquad I' = \frac{dI}{d\theta}
+$$
+
+### 程式
+
+```{r}
+#| output: asis
+show_code("ability.R", c("wle_setup", "wle_parts", "wle_solve"))
+show_code("algo.R", "algo_jme")
+```
+
+### RTMB 做什麼
+
+每個組合一個 theta，彼此獨立。
+所有組合的 $-f$ 加起來錄成一個 tape，`$newton()` 用對角的稀疏 Hessian 一次解出全部的 theta。
+$f'$、$f''$ 不用手推（以前要用三階、四階累積量）。
+SE 的 $I'$ 也是對 $I$ 錄 tape，再取 `$jacobian()`。
+
+### 對答案
+
+示範資料：`kitm03` 的語言題，6 個月以下的波次。
+先校準，再計分。
+
+```{r}
+lan_long <- kitm03$responses |>
+  filter(domain == "lan", wave_m <= 6)
+resp <- kits_resp(lan_long)
+item <- kits_item(resp, scale = "lan M03")
+scores <- kits_subj(resp, item)
+```
+
+每個人答了哪些題，接到分數表上，留下不重複的「題目組合 × 原始分」。
+
+```{r}
+sets_of <- lan_long |>
+  summarise(set = list(sort(unique(item_id))), .by = visit_id)
+combos <- as.data.frame(scores) |>
+  left_join(sets_of, by = "visit_id") |>
+  distinct(pattern_id, raw, theta, se, set)
+nrow(combos)
+```
+
+用套件的 `wle_setup()` 和 `wle_solve()` 直接解一次。
+它就是 `kits_subj()` 用的牛頓法，所以完全相同。
+
+```{r}
+parms <- kits:::param_frame(item)
+setup <- kits:::wle_setup(kits:::betas_by_item(parms), combos$set, combos$raw)
+theta_newton <- kits:::wle_solve(setup, combos$raw, seq_len(nrow(combos)))
+record("4", "WLE：牛頓法 vs kits_subj()", theta_newton - combos$theta)
+```
+
+再換一個不用導數的方法：`optimize()` 直接找 $f$ 的最大值。
+
+```{r}
+f_wle <- function(t, j) {
+  parts <- kits:::wle_parts(t, kits:::wle_subset(setup, j))
+  combos$raw[j] * t - parts$log_S + 0.5 * log(parts$info)
+}
+theta_opt <- map_dbl(seq_len(nrow(combos)), \(j) {
+  optimize(f_wle, c(-15, 15), j = j, maximum = TRUE, tol = 1e-10)$maximum
+})
+record("4", "WLE：kits_subj() vs optimize()", theta_opt - combos$theta)
+```
+
+差距是 `optimize()` 的容許誤差（黃金分割法只到約 1e-8）。
+
+SE 的 $I'$ 改用中央差分，代入 Warm 的公式。
+
+```{r}
+info_at <- function(t, j) kits:::wle_parts(t, kits:::wle_subset(setup, j))$info
+warm_se <- function(j, h = 1e-5) {
+  t <- combos$theta[j]
+  I <- info_at(t, j)
+  I1 <- (info_at(t + h, j) - info_at(t - h, j)) / (2 * h)
+  sqrt(I + (I1 / (2 * I))^2) / I
+}
+se_cd <- map_dbl(seq_len(nrow(combos)), warm_se)
+record("4", "WLE 的 SE：RTMB 的 I' vs 中央差分", se_cd - combos$se)
+```
+
+
+## 5 門檻和它的 SE
+
+### 公式
+
+第 $k$ 個步驟的 Thurstonian 門檻 $\tau_k$：能力在 $\tau_k$ 的人，得到 $k$ 分以上的機率剛好是 rp（預設 0.5）。
+
+$$
+P(X_i \ge k \mid \tau_k) = \mathrm{rp}, \qquad k = 1, \dots, m_i
+$$
+
+門檻是 beta 的隱函數。
+SE 用 delta method：
+
+$$
+\mathrm{SE}(\tau) = \sqrt{\mathrm{diag}\left(J \, V_\beta \, J^\top\right)}, \qquad
+J = \frac{\partial \tau}{\partial \beta}
+$$
+
+$J$ 不手推。
+kits 把門檻寫成一個最小化：
+
+$$
+\tau(\beta) = \arg\min_{\theta_1, \dots, \theta_m} \sum_k \left(P(X_i \ge k \mid \theta_k) - \mathrm{rp}\right)^2
+$$
+
+### 程式
+
+```{r}
+#| output: asis
+show_code("calibrate.R", c("p_at_least", "step_threshold", "threshold_jacobian", "step_thresholds"))
+```
+
+### RTMB 做什麼
+
+門檻本身用 `uniroot()` 找（不用導數）。
+`threshold_jacobian()` 把平方和錄成 tape，`$newton(seq_len(m))` 對前 $m$ 個變數（門檻）求解。
+結果是一個新的 tape：輸入 beta，輸出門檻。
+它的 `$jacobian()` 就是 $J$；隱函數的微分由 RTMB 做。
+
+### 對答案
+
+第 4 節示範資料的第一題（三個步驟）。
+
+```{r}
+one <- filter(item$thresholds, item_id == item$thresholds$item_id[1])
+thr <- kits:::step_thresholds(one$beta)$thr
+J <- kits:::threshold_jacobian(one$beta, thr, 0.5)
+```
+
+$J$ 和中央差分比：把每個 beta 推一點點，用 `uniroot()` 重解門檻。
+
+```{r}
+thr_of <- \(b) kits:::step_thresholds(b)$thr
+J_cd <- map(seq_along(one$beta), \(j) {
+  e <- replace(numeric(length(one$beta)), j, 1e-5)
+  (thr_of(one$beta + e) - thr_of(one$beta - e)) / 2e-5
+}) |>
+  do.call(what = cbind)
+record("5", "門檻的 jacobian：RTMB vs 中央差分", J - J_cd)
+```
+
+delta method 的 SE 和 `kits_item()` 的 `thr_se` 相同。
+
+```{r}
+rows <- which(item$fit$coef$item_id == one$item_id[1])
+V_i <- item$fit$est$acov.beta[rows, rows]
+record("5", "thr_se：J V J' vs kits_item()", sqrt(diag(J %*% V_i %*% t(J))) - one$thr_se)
+```
+
+
+## 6 ESF：給定原始分的條件分布
+
+### 公式
+
+第 2 節的 $\gamma_r$，拿掉第 $i$ 題的乘積記成 $\gamma^{(-i)}_r$。
+
+$$
+P(X_i = x \mid r) = \frac{e_{ix} \, \gamma^{(-i)}_{r - x}}{\gamma_r}
+$$
+
+theta 消掉了。
+條件適配和題目–其餘分數（第 9 節）都用它。
+
+$\log \gamma_r$ 對 beta 的導數也是一個機率：
+
+$$
+\frac{\partial \log \gamma_r}{\partial \beta_{ig}} = -P(X_i \ge g \mid r)
+$$
+
+### 程式
+
+```{r}
+#| output: asis
+show_code("algo.R", "algo_esf")
+```
+
+### RTMB 做什麼
+
+`algo_esf()` 本身是數值計算，不需要導數。
+但它不是第二份實作：$\gamma$ 直接用 CML 的 `cml_book_design()` 和 `cml_gamma_matrix()`。
+在 CML 裡，同一段程式被 RTMB 錄成 tape，微分就穿過這個多項式卷積。
+所以 ESF 和 CML 的 $\gamma$ 一個位元都不差。
+
+### 對答案
+
+四題，所有作答型態都列出來（3 × 3 × 2 × 2 = 36 種），直接加總。
+
+```{r}
+beta_of <- list(a1 = c(-1, 0), a2 = c(0, 1), a3 = 0.5, a4 = -0.5)
+esf <- algo_esf(beta_of)
+grid <- expand.grid(map(beta_of, \(b) 0:length(b)))
+w <- exp(-rowSums(map2_dfc(grid, beta_of, \(x, b) c(0, cumsum(b))[x + 1])))
+gamma_brute <- tapply(w, rowSums(grid), sum)
+record("6", "log gamma：algo_esf() vs 全部列舉", esf$log_gamma - log(gamma_brute))
+```
+
+條件分布：原始分 3 時，第 1 題的分數。
+
+```{r}
+p_brute <- map_dbl(0:2, \(x) sum(w[rowSums(grid) == 3 & grid$a1 == x]) / gamma_brute[["3"]])
+record("6", "P(X_1 = x | r = 3) vs 全部列舉", p_brute - esf$prob$a1[4, ])
+```
+
+最後讓 RTMB 穿過 `cml_gamma_matrix()` 對 beta 微分，和 $-P(X_i \ge g \mid r)$ 比。
+置中 $c = 0$ 時，$G$ 的第一列就是 $\gamma_r$。
+
+```{r}
+m <- lengths(beta_of)
+inp4 <- list(items = names(beta_of), m = unname(m), step_item = rep(names(beta_of), m),
+             book_items = list(seq_along(beta_of)))
+design4 <- kits:::cml_book_design(inp4)
+log_gamma <- \(b) log(kits:::cml_gamma_matrix(b, 0, inp4, design4)[1, ])
+J_gamma <- RTMB::MakeTape(log_gamma, unlist(beta_of))$jacobian(unlist(beta_of))
+```
+
+```{r}
+at_least <- map(esf$prob, \(P) t(apply(P, 1, \(p) rev(cumsum(rev(p)))))[, -1, drop = FALSE])
+record("6", "d log gamma / d beta vs -P(X >= g | r)", J_gamma + do.call(cbind, at_least))
+```
+
+
+## 7 連結檢查的潛在常態
+
+### 公式
+
+`kits_link_check()` 比較兩個世代在同一個波次的能力分佈。
+題目參數固定在自己的校準，能力分佈是 $N(\mu, \sigma^2)$，用邊際最大概似估 $\mu$、$\sigma$。
+原始分是充分統計量，所以每個人的邊際概似只和「題目組合 × 原始分」有關：
+
+$$
+L_p = \int \exp\left(r_p \theta - \sum_{i \in b_p} \log S_i(\theta)\right) \phi(\theta; \mu, \sigma) \, d\theta
+$$
+
+積分用固定的格點 $z_q$（-6 到 6，121 點），$\theta_q = \mu + \sigma z_q$：
+
+$$
+\log L_p \approx \log \sum_q \exp\left(r_p \theta_q - \sum_i \log S_i(\theta_q) + \log w_q\right)
+$$
+
+參數是 $\mu$ 和 $\log \sigma$。
+
+### 程式
+
+```{r}
+#| output: asis
+show_code("link_check.R", "latent_normal")
+```
+
+### RTMB 做什麼
+
+`log sum exp` 用 `RTMB::logspace_add()` 逐點累加，不會溢位，也可以微分。
+`MakeADFun()` 給梯度和 Hessian，交給第 3 節的 `fit_ad()`。
+`ADREPORT(exp(par$log_sd))` 宣告 $\sigma$ 是要報告的量；`sdreport()` 用 delta method 給它的 SE。
+
+### 對答案
+
+模擬六題、500 人，能力是 $N(0.5, 1.2^2)$。
+題目參數用真值，所以 $\hat\sigma$ 應該接近 1.2。
+
+```{r}
+betas6 <- list(a1 = c(-1, 0), a2 = c(0, 1), a3 = 0.5, a4 = -0.5, a5 = c(-0.5, 0.8), a6 = 1.5)
+set.seed(3)
+X6 <- kits_sim(rnorm(500, 0.5, 1.2), betas6, seed = 2)
+parms6 <- tibble(item_id = rep(names(betas6), lengths(betas6)),
+                 item_score = sequence(lengths(betas6)), beta = unlist(betas6, use.names = FALSE))
+```
+
+```{r}
+resp6 <- as_tibble(X6, rownames = "visit_id") |>
+  pivot_longer(-visit_id, names_to = "item_id", values_to = "item_score")
+ln <- kits:::latent_normal(resp6, as.data.frame(parms6))
+round(ln, 4)
+```
+
+`convergence` 是 `nlminb` 的代碼；和第 3 節一樣，之後的牛頓步才走到最大值。
+
+用 base R 照公式重寫一次 $-\log L$（不用 kits 的核心），再用 `optim()` 估。
+
+```{r}
+z <- seq(-6, 6, length.out = 121)
+log_w <- dnorm(z, log = TRUE) - log(sum(dnorm(z)))
+log_S_base <- function(th, b) {
+  eta <- outer(th, 0:length(b)) - rep(c(0, cumsum(b)), each = length(th))
+  log(rowSums(exp(eta)))
+}
+raw_n <- count(tibble(raw = rowSums(X6)), raw)
+```
+
+```{r}
+nll_base <- function(p) {
+  th <- p[1] + exp(p[2]) * z
+  ls <- reduce(map(betas6, \(b) log_S_base(th, b)), `+`)
+  -sum(raw_n$n * map_dbl(raw_n$raw, \(r) log(sum(exp(r * th - ls + log_w)))))
+}
+opt <- optim(c(0, 0), nll_base, method = "BFGS", control = list(reltol = 1e-14))
+record("7", "mu, sigma：kits vs base R optim()",
+       c(opt$par[1] - ln[["mean"]], exp(opt$par[2]) - ln[["sd"]]))
+```
+
+SE 和 `optimHess()` 的數值 Hessian 比；$\sigma$ 的 SE 用 delta method $\sigma \cdot \mathrm{SE}(\log\sigma)$。
+
+```{r}
+V_ln <- solve(optimHess(c(ln[["mean"]], log(ln[["sd"]])), nll_base))
+record("7", "SE(mu)、SE(sigma)：sdreport() vs 數值 Hessian",
+       c(sqrt(V_ln[1, 1]) - ln[["se_mean"]], ln[["sd"]] * sqrt(V_ln[2, 2]) - ln[["se_sd"]]))
+```
+
+差距在 1e-7 以下：是 `optim()` 和數值 Hessian 的誤差。
+
+
+## 8 shash 常模
+
+### 公式
+
+sinh-arcsinh 分布（Jones & Pewsey, 2009）用四個數描述一個月齡的分數：位置 $\mu$、尺度 $\sigma$、偏態 $\epsilon$、尾巴 $\delta$。
+令 $u = (y - \mu)/\sigma$，$a = \delta \, \mathrm{asinh}(u) + \epsilon$：
+
+$$
+\log f(y) = \log\delta - \log\sigma - \tfrac{1}{2}\log(2\pi) - \tfrac{1}{2}\log(1 + u^2)
+- \tfrac{1}{2}\sinh^2 a + \log\cosh a
+$$
+
+和 cNORM 一樣，四個參數都是月齡（轉換、標準化後的 $x$）的多項式：
+
+$$
+\mu = X_\mu c_\mu, \quad \log\sigma = X_\sigma c_\sigma, \quad \epsilon = X_\epsilon c_\epsilon, \quad
+\log\delta = X_\delta c_\delta
+$$
+
+$\log\sigma$、$\epsilon$ 夾在 $\pm 10$，$\log\delta$ 夾在 $\pm 2$。
+
+### 程式
+
+```{r}
+#| output: asis
+show_code("norms_shash.R", c("ad_clamp", "shash_link"))
+show_code("algo.R", "algo_shash")
+```
+
+### RTMB 做什麼
+
+`MakeADFun()` 給 $-\log L$ 的梯度和 Hessian，交給 `nlminb()`（和 kits 其他的估計一樣；cNORM 用 `optim()` 的 L-BFGS-B，兩者到同一個解，差約 $10^{-6}$）。
+RTMB 不能對 `pmin()`、`pmax()` 微分，所以夾的動作寫成 `ad_clamp()`：$(|v + b| - |v - b|)/2$，數學上相同。
+$\log\cosh$ 寫成 $|a| + \mathrm{log1p}(e^{-2|a|}) - \log 2$，大的 $a$ 也不會溢位。
+
+### 對答案
+
+模擬 1,500 個孩子，3 到 36 個月，分數右偏。
+月齡用平方根轉換；多項式的次數 `c(3, 2, 1, 1)`。
+
+```{r}
+set.seed(5)
+age <- runif(1500, 3, 36)
+y <- 2 * log(age / 12) + rnorm(1500, 0, 0.8) + 0.4 * rexp(1500)
+shash <- algo_shash(sqrt(age), y, c(3, 2, 1, 1), 1)
+shash[c("value", "converged", "grad_max")]
+```
+
+shash 的密度，照 Jones & Pewsey 的原式另寫一次（不取對數）：
+
+$$
+f(y) = \frac{\delta \cosh a}{\sigma \sqrt{2\pi(1 + u^2)}} \exp\left(-\tfrac{1}{2}\sinh^2 a\right)
+$$
+
+```{r}
+dshash <- function(y, p) {
+  u <- (y - p$mu) / p$sigma
+  a <- p$delta * asinh(u) + p$epsilon
+  p$delta * cosh(a) / (p$sigma * sqrt(2 * pi * (1 + u^2))) * exp(-sinh(a)^2 / 2)
+}
+```
+
+在估計值，這個密度的 $-\log L$ 和 RTMB 的值相同。
+
+```{r}
+par_at <- kits:::shash_parameters(shash, sqrt(age))
+record("8", "-log L：RTMB vs base R 的密度", -sum(log(dshash(y, par_at))) - shash$value)
+```
+
+base R 的 $-\log L$ 對係數的中央差分，最大的梯度和 RTMB 報告的 `grad_max` 相同。
+
+```{r}
+coef_all <- with(shash, c(mu_est, sigma_est, epsilon_est, delta_est))
+nll_shash <- function(cf) {
+  s <- split(cf, rep(1:4, shash$degrees + 1))
+  m <- modifyList(shash, list(mu_est = s[[1]], sigma_est = s[[2]],
+                              epsilon_est = s[[3]], delta_est = s[[4]]))
+  -sum(log(dshash(y, kits:::shash_parameters(m, sqrt(age)))))
+}
+g_cd <- central_diff(nll_shash, coef_all, h = 1e-6)
+record("8", "最大 |梯度|：RTMB vs 中央差分", max(abs(g_cd)) - shash$grad_max)
+```
+
+`grad_max` 是 `r format(signif(shash$grad_max, 2))`，小於收斂的標準 `r shash$grad_tol`（1e-6 × 資料筆數）。
+
+20 個月的密度積分是 1。
+
+```{r}
+p20 <- kits:::shash_parameters(shash, sqrt(20))
+record("8", "20 個月的密度積分 - 1", integrate(\(v) dshash(v, p20), -Inf, Inf)$value - 1)
+```
+
+百分位曲線和資料：
+
+```{r}
+curves <- tibble(age_m = seq(3, 36, by = 0.5)) |>
+  mutate(p = map(age_m, \(a) kits:::shash_parameters(shash, sqrt(a)))) |>
+  unnest(p) |>
+  mutate(P10 = mu + sigma * sinh((asinh(qnorm(0.1)) - epsilon) / delta),
+         P50 = mu + sigma * sinh((asinh(qnorm(0.5)) - epsilon) / delta),
+         P90 = mu + sigma * sinh((asinh(qnorm(0.9)) - epsilon) / delta))
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 4
+curves |>
+  pivot_longer(c(P10, P50, P90), names_to = "pct", values_to = "score") |>
+  ggplot(aes(age_m, score)) +
+  geom_point(aes(age, y), data = tibble(age, y), colour = "#7F7F7F", alpha = 0.25, size = 0.8) +
+  geom_line(aes(group = pct, colour = pct == "P50"), linewidth = 0.9) +
+  scale_colour_manual(values = c(`TRUE` = "#0072B2", `FALSE` = "#D55E00"),
+                      labels = c(`TRUE` = "P50", `FALSE` = "P10、P90"), name = NULL) +
+  labs(x = "月齡", y = "分數", title = "shash 常模：P10、P50、P90") +
+  theme_minimal(base_size = 12)
+```
+
+
+## 9 0.24.0 的新東西
+
+0.23.1 之後，只剩兩個地方還有手寫的導數。
+0.24.0 把它們也交給 RTMB。
+
+### 9.1 訊息的斜率：`information_slope()`
+
+#### 公式
+
+測驗訊息 $I(\theta) = \sum_i \mathrm{Var}_i(\theta)$。
+它的斜率是三階中央動差的和（第 1 節的恆等式再微分一次）：
+
+$$
+I'(\theta) = \sum_i \frac{d}{d\theta} \mathrm{Var}_i(\theta) = \sum_i M_{3,i}(\theta)
+$$
+
+0.23.1 以前，kits 直接用右邊的公式。
+0.24.0 只寫 $I(\theta)$（`tcc()` 的 `slope`），斜率由 RTMB 給。
+
+#### 程式
+
+```{r}
+#| output: asis
+show_code("pcm_core.R", "information_slope")
+```
+
+#### RTMB 做什麼
+
+`MakeTape()` 把 $\sum_\theta I(\theta)$ 錄成 tape。
+每個 $I$ 只和自己的 theta 有關，所以 `$jacobian()` 的每一個元素就是那個 theta 的 $I'$。
+
+#### 對答案
+
+第 4 節的示範資料校準（語言，M03）。
+
+```{r}
+its <- unique(parms$item_id)
+theta_grid <- seq(-6, 6, by = 0.1)
+slope <- kits:::information_slope(theta_grid, parms, its)
+beta_by <- kits:::betas_by_item(parms)
+m3 <- map(its, \(i) algo_pcm(theta_grid, beta_by[[i]], third = TRUE)$M3) |>
+  reduce(`+`)
+record("9", "I'(theta)：RTMB vs 三階中央動差的和", slope - m3)
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 4
+info_df <- tibble(theta = theta_grid, info = kits:::tcc(theta_grid, parms, its)$slope,
+                  slope = slope, m3 = m3)
+ggplot(info_df, aes(theta)) +
+  geom_line(aes(y = info, colour = "I(theta)"), linewidth = 0.9) +
+  geom_line(aes(y = slope, colour = "I'(theta)（RTMB）"), linewidth = 0.9, linetype = "dashed") +
+  geom_point(aes(y = m3, colour = "sum M3"), data = filter(info_df, row_number() %% 5 == 1)) +
+  scale_colour_manual(values = c(`I(theta)` = "#0072B2", `I'(theta)（RTMB）` = "#D55E00",
+                                 `sum M3` = "#7F7F7F"), name = NULL) +
+  labs(x = "theta", y = NULL, title = "測驗訊息和它的斜率（kitm03 語言，M03）") +
+  theme_minimal(base_size = 12)
+```
+
+灰點（三階中央動差的和）落在橘色虛線（RTMB 的斜率）上。
+
+### 9.2 Goodman–Kruskal gamma 的 SE：`gk_gamma()`
+
+#### 公式
+
+`kits_item_restscore()`（Kreiner, 2011）比較題目分數和其餘分數的 gamma。
+$n_a$ 是表格第 $a$ 格的次數。
+$\pi^c_a$、$\pi^d_a$ 是和第 $a$ 格一致、不一致的格子的次數和：
+
+$$
+C = \tfrac{1}{2}\sum_a n_a \pi^c_a, \qquad D = \tfrac{1}{2}\sum_a n_a \pi^d_a, \qquad
+\gamma = \frac{C - D}{C + D}
+$$
+
+delta method（多項分布）：
+
+$$
+\mathrm{SE}^2 = \sum_a n_a J_a^2 - \left(\sum_a n_a J_a\right)^2, \qquad J_a = \frac{\partial\gamma}{\partial n_a}
+$$
+
+0.23.1 以前，$J$ 用發表的公式（vcdExtra 的 `GKgamma()` 的 $\psi$）：
+
+$$
+\psi_a = \frac{2\left(D \, \pi^c_a - C \, \pi^d_a\right)}{(C + D)^2}
+$$
+
+0.24.0 只寫 $\gamma$，$J$ 由 RTMB 給。
+
+#### 程式
+
+```{r}
+#| output: asis
+show_code("restscore.R", "gk_gamma")
+```
+
+#### RTMB 做什麼
+
+$\gamma$ 寫成格子次數的函數 `gamma_of(n)`。
+`MakeTape(gamma_of, n)$jacobian(n)` 就是 $J = \partial\gamma / \partial n$。
+不用推 $\psi$。
+
+#### 對答案
+
+第 2 節的模擬資料：第 1 題的分數 × 其餘分數，只用答了五題的 300 人。
+
+```{r}
+full <- X[complete.cases(X), ]
+tab <- table(rest = rowSums(full[, -1]), item = full[, "a1"])
+gk <- kits:::gk_gamma(unclass(tab))
+unlist(gk)
+```
+
+照 $\psi$ 的公式，用 base R 算一次。
+
+```{r}
+tab_n <- unclass(tab)
+same_dir <- \(i, j) sum(tab_n[row(tab_n) < i & col(tab_n) < j]) +
+  sum(tab_n[row(tab_n) > i & col(tab_n) > j])
+oppo_dir <- \(i, j) sum(tab_n[row(tab_n) < i & col(tab_n) > j]) +
+  sum(tab_n[row(tab_n) > i & col(tab_n) < j])
+pi_c <- outer(seq_len(nrow(tab_n)), seq_len(ncol(tab_n)), Vectorize(same_dir))
+pi_d <- outer(seq_len(nrow(tab_n)), seq_len(ncol(tab_n)), Vectorize(oppo_dir))
+```
+
+```{r}
+C <- sum(tab_n * pi_c) / 2
+D <- sum(tab_n * pi_d) / 2
+psi <- 2 * (D * pi_c - C * pi_d) / (C + D)^2
+se_psi <- sqrt(sum(tab_n * psi^2) - sum(tab_n * psi)^2)
+record("9", "GK gamma：RTMB vs (C - D) / (C + D)", gk$gamma - (C - D) / (C + D))
+record("9", "GK gamma 的 SE：RTMB 的 J vs psi 公式", gk$se - se_psi)
+```
+
+
+## 10 數字怎麼驗證
+
+### 10.1 這份文件的對答案
+
+```{r}
+checks |>
+  mutate(max_diff = formatC(max_diff, format = "e", digits = 1)) |>
+  rename(節 = section, 比較 = check, 最大差距 = max_diff) |>
+  knitr::kable()
+```
+
+差距分三種。
+
+* 0 或 1e-15 左右：同一個數字的兩條路（例如 advector 和數值），或和全部列舉比。
+* 1e-12 到 1e-8：和中央差分、`integrate()`、另一種寫法的密度比；誤差來自差分本身（$h^2$ 和捨入）或數值積分。
+* 1e-8 到 1e-7：和 `optimize()`、`optim()` 這類有容許誤差的方法比。
+
+### 10.2 改版前後
+
+0.23.1 把所有估計的導數交給 RTMB（`kits/NEWS.md` 的 0.23.1 一節）。
+當時和 0.23.0 逐位比過：
+
+* 校準（CML）、連結、常模：一個位元都不變。
+* WLE 的 theta 和 SE：最多差約 1e-12（示範資料 6e-13；兩個模擬設計的 1,230 和 2,965 個組合，3e-13）。
+  例外是加權概似有兩個高點的情形：現在和 TAM 一樣，停在起始值走到的那一個。
+* 門檻的 SE：最多差 5e-11（以前用中央差分）。
+* 連結檢查的潛在常態：以前 `optim()` 停在梯度 1e-3 左右，所以平均和 SD 動了最多 7e-6；新的值 $-\log L$ 更低。
+
+0.24.0 的兩個新地方（第 9 節）：
+
+* 訊息的斜率：和三階中央動差的和差在 1e-12 以內（套件有測試檢查這個恆等式）。
+* GK gamma 的 SE：不變（測試和 vcdExtra 的值比）。
+
+### 10.3 和其他套件比
+
+這份文件不重跑其他套件。
+比較在另外幾份教學裡：
+
+* [kits、kitsPreview 和 TAM](../tutorial_compare/kits_compare_TAM.html)：同一份 KIT 語言資料，CML（kits）、dexter（kitsPreview）、TAM 的校準、門檻、WLE、原始分換算表和連結。
+* [kits 的演算法](../tutorial_algorithms/01_calibration.html)（`tutorial_algorithms/` 的六份，01 校準到 06 量尺）：每一步的公式、程式和對答案。
+* [kitsPreview 教學](../tutorial_preview/kitsPreview_tutorial_zh.html) 第 8 節：kitsPreview 和 kits 的數字相同。
+
+```{r}
+render_time <- round(as.numeric(difftime(Sys.time(), t_start, units = "secs")), 1)
+```
+
+這份文件用 kits `r packageVersion("kits")` 和 RTMB `r packageVersion("RTMB")` 產生，所有程式跑了 `r render_time` 秒。
+
+
+## 參考文獻
+
+Firth, D. (1993). Bias reduction of maximum likelihood estimates. *Biometrika, 80*(1), 27–38.
+
+Jones, M. C., & Pewsey, A. (2009). Sinh-arcsinh distributions. *Biometrika, 96*(4), 761–780.
+
+Kreiner, S. (2011). A note on item-restscore association in Rasch models. *Applied Psychological Measurement, 35*, 557–561.
+
+Kristensen, K. (2024). RTMB: 'R' bindings for 'TMB'. R package.
+
+Magis, D. (2015). A note on weighted likelihood and Jeffreys modal estimation of proficiency levels in polytomous item response models. *Psychometrika, 80*(1), 200–204.
+
+Masters, G. N. (1982). A Rasch model for partial credit scoring. *Psychometrika, 47*(2), 149–174.
+
+Warm, T. A. (1989). Weighted likelihood estimation of ability in item response theory. *Psychometrika, 54*(3), 427–450.

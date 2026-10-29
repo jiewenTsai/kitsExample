@@ -1,0 +1,964 @@
+---
+title: "kits 的演算法 5：檢查題目"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    embed-resources: true
+    from: markdown+east_asian_line_breaks
+    grid:
+      body-width: 1100px
+---
+
+```{=html}
+<style>
+.MathJax_Display, mjx-container { overflow-x: auto; overflow-y: hidden; }
+</style>
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+options(width = 100)
+library(kits)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+t_start <- Sys.time()
+```
+
+## 0 這份教學
+
+校準（[01](01_calibration.html)）給每一題的步驟參數。
+但參數只在模型成立時才有意義。
+這份教學檢查三件事：
+
+1. 題目適配：每一題的作答和 PCM 說的一樣嗎？（第 2、3 節）
+2. 組間差異：同一題對男孩、女孩，對高分、低分的孩子，難度一樣嗎？（第 4 節）
+3. 偏移：新的一波資料裡，題目還和舊的校準一樣嗎？（第 5 節）
+
+你會學到：
+
+* 每一步是做什麼用的。
+* 它的公式：排成數學式，也放在 `latex` 區塊裡，按右上角就能複製。
+* 怎麼在模擬資料上一步一步手算。
+* kits 的函數和 `algo_` 的演算法給同樣的數字（印出 `TRUE`）。
+* 套件裡的教學程式（`dif.R`、`drift.R`）在哪一段。
+* 貼到新的 R 就能重做的流程（第 6 節）。
+
+你需要：
+
+* 讀過 [01 校準](01_calibration.html)：CML、步驟參數 $\beta$、門檻 $\mathit{thr}$。
+* 偏移用到連結的 mean/sigma 線（[03 連結](03_linking.html)）。
+* 模型本身（CML、ESF、gamma 的 SE）的程式在 [kits 的模型](../tutorial_models/kits_models.html)；這裡指過去，不重複。
+* 套件：kits，和整理資料用的 dplyr、tidyr、purrr、tibble（`library()` 這五個）。
+
+### 0.1 小工具
+
+`script_part()` 從套件的教學程式讀出一段（從 `# ==== part: 名字 ====` 到下一個 `# ====`）：
+
+```{r}
+script_part <- function(file, part) {
+  lines <- readLines(system.file("scripts", file, package = "kits"))
+  start <- grep(sprintf("^# ==== part: %s ====", part), lines)
+  if (length(start) != 1) stop("no part ", part, " in ", file)
+  marks <- grep("^# ==== ", lines)
+  end <- c(marks[marks > start], length(lines) + 1)[1] - 1
+  cat("```r", lines[start:end], "```", sep = "\n")
+}
+```
+
+`run_script()` 在一個新的環境裡執行整份教學程式，印出來的東西不顯示：
+
+```{r}
+run_script <- function(file) {
+  env <- new.env(parent = globalenv())
+  path <- system.file("scripts", file, package = "kits")
+  printed <- capture.output(suppressMessages(sys.source(path, envir = env)))
+  env
+}
+```
+
+`run_fresh()` 把這份文件的一個程式區塊，放到一個新的 R 裡執行（只有 `library(kits)`），帶回最後的值：
+
+```{r}
+run_fresh <- function(label) {
+  code <- paste(knitr::knit_code$get(label), collapse = "\n")
+  callr::r(\(code) {
+    library(kits)
+    eval(parse(text = code), envir = globalenv())
+  }, args = list(code = code))
+}
+```
+
+`same()` 比兩組數字，容許 $10^{-12}$ 的相對誤差（加總的順序不同時的浮點誤差）。
+完全相同的地方用 `identical()`。
+
+```{r}
+same <- function(a, b, tol = 1e-12) {
+  isTRUE(all.equal(as.vector(a), as.vector(b), tolerance = tol))
+}
+```
+
+### 0.2 演算法一覽
+
+`kits_algorithm()` 列出一個主題的步驟、公式、元件和引用。
+組間差異：
+
+```{r}
+kits_algorithm("dif")
+```
+
+偏移：
+
+```{r}
+kits_algorithm("drift")
+```
+
+這份教學照這些步驟，一步一步做一次。
+
+## 1 資料
+
+一個領域（語言），10 題，由易到難。
+第 1、4、9 題是兩點計分（0、1），其他是三點計分（0、1、2）。
+
+```{r}
+set.seed(7)
+b <- seq(-2.5, 3, length.out = 10)
+betas <- map(b, \(x) x + c(-0.5, 0.5))
+betas[c(1, 4, 9)] <- b[c(1, 4, 9)]
+names(betas) <- sprintf("lan%02d", 1:10)
+```
+
+兩個世代，每個波次 200 個孩子；每個孩子有性別。
+
+```{r}
+persons <- tibble(cohort = rep(c("M03", "M03", "M03", "M36", "M36"), each = 200),
+                  wave_m = rep(c(6, 12, 24, 36, 48), each = 200)) |>
+  mutate(visit_id = paste(cohort, wave_m, 1:200, sep = "_"),
+         age_m = wave_m + runif(n(), -1, 1),
+         sex = sample(c("boy", "girl"), n(), replace = TRUE))
+theta <- 1.8 * log(persons$age_m / 12) + rnorm(1000, 0, 0.9)
+m03 <- persons$cohort == "M03"
+```
+
+M03 答第 1–8 題，M36 答第 5–10 題：
+
+```{r}
+X03 <- kits_sim(theta[m03], betas[1:8])
+rownames(X03) <- persons$visit_id[m03]
+X36 <- kits_sim(theta[!m03], betas[5:10])
+rownames(X36) <- persons$visit_id[!m03]
+```
+
+M03 的第 2 題對女孩難 0.8 logit（性別 DIF），所以女孩的這一題重新模擬：
+
+```{r}
+girl03 <- persons$sex[m03] == "girl"
+lan02_girl <- kits_sim(theta[m03][girl03], list(lan02 = betas$lan02 + 0.8))
+X03[girl03, "lan02"] <- lan02_girl[, "lan02"]
+```
+
+M03 的三個波次題本不同：6 個月不答第 7、8 題，24 個月不答第 1、2 題，12 個月有 10 個孩子漏答第 8 題。
+
+```{r}
+w03 <- persons$wave_m[m03]
+X03[w03 == 6, c("lan07", "lan08")] <- NA
+X03[w03 == 24, c("lan01", "lan02")] <- NA
+X03[which(w03 == 12)[1:10], "lan08"] <- NA
+```
+
+校準一次。
+`algo_cml()` 是同一個 CML，只有數字進、數字出：
+
+```{r}
+item03 <- kits_item(X03, scale = "lan M03")
+cml03 <- kits_stats(X03) |>
+  algo_cml()
+beta_of <- cml03$betas
+identical(cml03$coef$beta, coef(item03)$beta)
+```
+
+`beta_of` 是一題一個向量的步驟參數，後面的手算都用它。
+
+長格式（一列一個作答），和每個孩子的作答組合（答了哪些題）與原始分：
+
+```{r}
+long03 <- as_tibble(X03, rownames = "visit_id") |>
+  pivot_longer(-visit_id, names_to = "item_id", values_to = "x", values_drop_na = TRUE)
+by_person <- long03 |>
+  summarise(pattern = paste(item_id, collapse = " "), raw = sum(x), .by = visit_id)
+count(by_person, pattern)
+```
+
+## 2 題目適配：`kits_itemfit()`
+
+### 2.1 做什麼用
+
+一題的分數，有時比模型說的更亂，有時更整齊。
+適配把每個作答的「實際分數減期望分數」（殘差）加起來看。
+均方約是 1：和模型一樣。
+大於 1：比模型更亂（雜訊，或量到別的東西）。
+小於 1：比模型更好預測（例如和另一題幾乎一樣）。
+
+kits 預設用條件殘差：給定孩子的原始分，不需要估 $\theta$。
+這樣，模型成立時均方約是 1，不論題本多長。
+
+### 2.2 公式
+
+給定作答組合 $b$ 裡的原始分 $r$，題目 $i$ 得 $x$ 分的機率只要 $\gamma$（elementary symmetric functions，[01](01_calibration.html)）：
+
+$$
+P(X_{pi} = x \mid r_p, b) = \frac{e_{ix}\,\gamma^{(-i)}_{b,\,r_p - x}}{\gamma_{b,\,r_p}},\quad
+e_{ix} = e^{-\sum_{g=1}^{x}\beta_{ig}}
+$$
+
+```latex
+P(X_{pi} = x \mid r_p, b) = \frac{e_{ix}\,\gamma^{(-i)}_{b,\,r_p - x}}{\gamma_{b,\,r_p}},\quad
+e_{ix} = e^{-\sum_{g=1}^{x}\beta_{ig}}
+```
+
+期望分數 $E$、變異數 $W$，和兩個均方：
+
+$$
+E_{pi} = \sum_x x\,P(X_{pi} = x \mid r_p, b),\quad
+W_{pi} = \sum_x (x - E_{pi})^2 P(X_{pi} = x \mid r_p, b),\quad
+\text{infit} = \frac{\sum (x - E)^2}{\sum W},\quad
+\text{outfit} = \frac{1}{n}\sum \frac{(x - E)^2}{W}
+$$
+
+```latex
+E_{pi} = \sum_x x\,P(X_{pi} = x \mid r_p, b),\quad
+W_{pi} = \sum_x (x - E_{pi})^2 P(X_{pi} = x \mid r_p, b),\quad
+\text{infit} = \frac{\sum (x - E)^2}{\sum W},\quad
+\text{outfit} = \frac{1}{n}\sum \frac{(x - E)^2}{W}
+```
+
+* $\gamma^{(-i)}$：拿掉題目 $i$ 的 $\gamma$。
+* 加總是一題的所有作答；$n$ 是項數。
+* $W = 0$ 的作答不算：0 分、滿分，或只答一題。
+* `flag`：任一個均方大於 1.4 是 underfit；不然，任一個小於 0.6 是 overfit（Wright & Linacre, 1994）。
+  它提醒你去看那一題，不是刪題的規則。
+* 均方是效果量，不是檢定，所以 kits 不給 $p$ 值。
+
+### 2.3 手算
+
+先在一個作答組合（24 個月：lan03–lan08）、一個原始分上，照公式算一次。
+一題的多項式是 $1 + \sum_k e_{ik} z^k$；$\gamma_r$ 是這些多項式乘起來的 $z^r$ 係數。
+
+```{r}
+poly_item <- function(beta) c(1, exp(-cumsum(beta)))
+poly_times <- function(p, q) {
+  out <- numeric(length(p) + length(q) - 1)
+  for (k in seq_along(q)) out[seq_along(p) + k - 1] <- out[seq_along(p) + k - 1] + p * q[k]
+  out
+}
+gamma_of <- function(items) reduce(map(beta_of[items], poly_item), poly_times)
+```
+
+lan05 在原始分 $r = 4$ 時得 0、1、2 分的機率：
+
+```{r}
+items24 <- sprintf("lan%02d", 3:8)
+r <- 4
+e5 <- poly_item(beta_of$lan05)
+g_rest <- gamma_of(setdiff(items24, "lan05"))
+p_hand <- e5 * g_rest[r - 0:2 + 1] / gamma_of(items24)[r + 1]
+p_hand
+```
+
+`algo_esf()` 一次給這個作答組合所有的 $\gamma$ 和條件分布（`prob` 一題一個矩陣，列是 $r$）：
+
+```{r}
+esf24 <- algo_esf(beta_of[items24])
+p_algo <- esf24$prob$lan05[r + 1, ]
+same(p_hand, p_algo)
+```
+
+`algo_esf()` 先把 $\beta$ 置中再算，所以兩者只差浮點誤差。
+條件期望分數加起來就是原始分：
+
+```{r}
+same(rowSums(esf24$expected), 0:esf24$max_score)
+```
+
+現在對每個作答組合都做一次，表裡一列是「組合 × 原始分 × 題」：
+
+```{r}
+cond_table <- function(pattern) {
+  items <- strsplit(pattern, " ")[[1]]
+  esf <- algo_esf(beta_of[items])
+  r <- 0:esf$max_score
+  tibble(pattern, raw = rep(r, length(items)), item_id = rep(items, each = length(r)),
+         E = as.vector(esf$expected), W = as.vector(esf$variance), free = as.vector(esf$free))
+}
+```
+
+每個作答接上它的 $E$、$W$，拿掉 $W = 0$ 的，再按題目算兩個均方：
+
+```{r}
+fit_hand <- long03 |>
+  left_join(by_person, by = "visit_id") |>
+  left_join(map(unique(by_person$pattern), cond_table) |> list_rbind(),
+            by = c("pattern", "raw", "item_id")) |>
+  filter(free) |>
+  summarise(n = n(), infit = sum((x - E)^2) / sum(W), outfit = mean((x - E)^2 / W),
+            .by = item_id)
+```
+
+### 2.4 用 kits
+
+```{r}
+fit03 <- kits_itemfit(X03, item03)
+fit03
+```
+
+和手算比：
+
+```{r}
+both_fit <- left_join(fit_hand, as_tibble(fit03), by = "item_id", suffix = c("", "_kits"))
+c(n = identical(both_fit$n, both_fit$n_kits), infit = same(both_fit$infit, both_fit$infit_kits),
+  outfit = same(both_fit$outfit, both_fit$outfit_kits))
+```
+
+校準的結果裡已經有同一張表：
+
+```{r}
+identical(fit03$infit, item03$itemfit$infit)
+```
+
+`rir` 和 `pvalue` 是每個作答組合各算一次，再用人數加權平均。
+`rir` 是這一題和同一組合其他題總分的相關；`pvalue` 是平均分除以這一題觀察到的最高分。
+
+```{r}
+tia <- long03 |>
+  left_join(by_person, by = "visit_id") |>
+  mutate(top = max(x), .by = item_id) |>
+  summarise(n = n(), rir = cor(x, raw - x), pvalue = mean(x) / top[1], .by = c(pattern, item_id))
+```
+
+```{r}
+tia_hand <- tia |>
+  filter(is.finite(rir)) |>
+  summarise(rir = weighted.mean(rir, n), .by = item_id) |>
+  left_join(summarise(tia, pvalue = weighted.mean(pvalue, n), .by = item_id), by = "item_id")
+c(rir = same(tia_hand$rir, fit03$rir), pvalue = same(tia_hand$pvalue, fit03$pvalue))
+```
+
+`rir` 算不出來的組合（只有一題沒有變異）不算。
+
+### 2.5 另一種：在 WLE 上的殘差
+
+`type = "wle"` 用每個孩子的 $\hat\theta$ 算 $E$、$W$。
+`algo_pcm()` 給一題在一組 $\theta$ 的類別機率、$E$ 和變異數：
+
+```{r}
+pcm_EW <- function(theta, beta) {
+  m <- algo_pcm(theta, beta)
+  tibble(E = m$E, W = m$Var)
+}
+```
+
+0 分和滿分的孩子不算：
+
+```{r}
+s03 <- kits_subj(X03, item03)
+fit_wle_hand <- long03 |>
+  inner_join(filter(s03, raw > 0, raw < raw_max) |> select(visit_id, theta), by = "visit_id") |>
+  mutate(pcm_EW(theta, beta_of[[item_id[1]]]), .by = item_id) |>
+  summarise(infit = sum((x - E)^2) / sum(W), .by = item_id)
+same(fit_wle_hand$infit, kits_itemfit(X03, item03, type = "wle")$infit)
+```
+
+每個 $\hat\theta$ 都是從同樣的作答估的，所以題本短時，即使 PCM 成立，WLE 版的均方也低於 1（Kreiner & Christensen, 2011）。
+所以預設用條件版。
+每個孩子的適配（`kits_subj()` 的 `infit`、`outfit`）在 [02 計分](02_scoring.html)；教學程式是 `wle.R` 的 `person_fit` 段。
+
+## 3 題目和其餘分數的 gamma：`kits_item_restscore()`
+
+### 3.1 做什麼用
+
+一題分數高的孩子，其他題的總分（其餘分數）也應該比較高。
+這個關聯可以用 Goodman–Kruskal 的 $\gamma$ 量。
+PCM 也說得出這個 $\gamma$ 應該多大（Kreiner, 2011）。
+觀察的比期望小：這一題分開孩子的能力比模型說的差。
+比期望大：分得更開，例如題目之間有局部相依。
+
+### 3.2 公式
+
+一張「其餘分數 $r$ × 題目分數 $x$」的表，格子人數 $n_{rx}$。
+$A_{rx}$、$B_{rx}$ 是和格子 $(r, x)$ 一致、不一致的格子人數：
+
+$$
+C = \tfrac12\sum_{rx} n_{rx} A_{rx},\quad D = \tfrac12\sum_{rx} n_{rx} B_{rx},\quad
+\gamma = \frac{C - D}{C + D}
+$$
+
+```latex
+C = \tfrac12\sum_{rx} n_{rx} A_{rx},\quad D = \tfrac12\sum_{rx} n_{rx} B_{rx},\quad
+\gamma = \frac{C - D}{C + D}
+```
+
+期望的表：總分 $t$ 的人數 $N_t$ 照觀察的，分到各個題目分數用條件分布（第 2.2 節）；SE 用 delta method：
+
+$$
+E_{rx} = N_{r+x}\,P(X_i = x \mid T = r + x),\quad
+\mathrm{SE}^2 = \sum n_{rx}\psi_{rx}^2 - \Big(\sum n_{rx}\psi_{rx}\Big)^2,\quad
+\psi_{rx} = \frac{\partial\gamma}{\partial n_{rx}},\quad
+z = \frac{\gamma_{\mathrm{obs}} - \gamma_{\mathrm{exp}}}{\mathrm{SE}}
+$$
+
+```latex
+E_{rx} = N_{r+x}\,P(X_i = x \mid T = r + x),\quad
+\mathrm{SE}^2 = \sum n_{rx}\psi_{rx}^2 - \Big(\sum n_{rx}\psi_{rx}\Big)^2,\quad
+\psi_{rx} = \frac{\partial\gamma}{\partial n_{rx}},\quad
+z = \frac{\gamma_{\mathrm{obs}} - \gamma_{\mathrm{exp}}}{\mathrm{SE}}
+```
+
+* 每個作答組合（至少 `min_n` 人，預設 100）各算一列：不同組合的其餘分數不能比。
+* $p$ 是雙尾常態；`p_adj` 是所有列一起的 Benjamini–Hochberg。
+* kits 的 $\psi$ 由 RTMB 對 $\gamma$ 自動微分（[模型教學](../tutorial_models/kits_models.html) 第 9.2 節）。
+  手算時用它的封閉式 $\psi_{rx} = 2(A_{rx}D - B_{rx}C)/(C + D)^2$。
+
+### 3.3 手算
+
+24 個月的作答組合，lan04 的觀察表：
+
+```{r}
+in24 <- by_person$visit_id[by_person$pattern == paste(items24, collapse = " ")]
+X24 <- X03[rownames(X03) %in% in24, items24]
+x4 <- X24[, "lan04"]
+rest4 <- rowSums(X24) - x4
+obs <- table(factor(rest4, 0:(esf24$max_score - 1)), factor(x4, 0:1))
+```
+
+每一格的一致、不一致人數（列和欄同方向不同是一致，反方向是不一致）：
+
+```{r}
+concord <- function(n) {
+  rr <- row(n)
+  xx <- col(n)
+  A <- map_dbl(seq_along(n), \(a) sum(n[(rr - rr[a]) * (xx - xx[a]) > 0]))
+  B <- map_dbl(seq_along(n), \(a) sum(n[(rr - rr[a]) * (xx - xx[a]) < 0]))
+  list(A = A, B = B, C = sum(n * A) / 2, D = sum(n * B) / 2)
+}
+```
+
+$\gamma$ 和它的 SE：
+
+```{r}
+gk <- function(n) {
+  k <- concord(n)
+  psi <- 2 * (k$A * k$D - k$B * k$C) / (k$C + k$D)^2
+  c(gamma = (k$C - k$D) / (k$C + k$D), se = sqrt(sum(n * psi^2) - sum(n * psi)^2))
+}
+```
+
+期望的表：`esf24$prob$lan04` 是 $P(X = x \mid T = t)$，一列一個總分 $t$。
+
+```{r}
+N_t <- tabulate(rowSums(X24) + 1, nbins = esf24$max_score + 1)
+P4 <- esf24$prob$lan04
+expected <- outer(0:(nrow(P4) - 2), 0:1, \(k, x) N_t[k + x + 1] * P4[cbind(k + x + 1, x + 1)])
+rs_hand <- c(gk(obs), gamma_exp = gk(expected)[["gamma"]])
+rs_hand
+```
+
+### 3.4 用 kits
+
+```{r}
+rs03 <- kits_item_restscore(X03, item03)
+rs03
+```
+
+24 個月的作答組合是 `pattern_id` 的哪一個，從分數表看：
+
+```{r}
+pid24 <- unique(s03$pattern_id[s03$visit_id %in% in24])
+rs_kits <- as_tibble(rs03) |>
+  filter(item_id == "lan04", pattern_id == pid24)
+same(rs_hand, c(rs_kits$gamma_obs, rs_kits$se, rs_kits$gamma_exp))
+```
+
+`plot(rs03)` 畫觀察對期望的 $\gamma$；離開對角線的是不適配的題。
+人數多時，很小的差也會「顯著」，所以看 $\gamma_{\mathrm{obs}} - \gamma_{\mathrm{exp}}$ 的大小，不只看 $p$。
+
+## 4 組間差異：`kits_dif()`
+
+### 4.1 做什麼用
+
+同一題，對兩群孩子的難度應該一樣。
+不一樣時，比較兩群的分數就不公平。
+`kits_dif(data, group)` 把人次分組，每組各自用 CML 校準，再比較步驟參數。
+`group` 有三種給法：
+
+* 一個向量，每列一個組，例如性別。
+* `"raw"`：Andersen 的分法，原始分的高低兩組（在每個作答組合裡用中位數分）。
+* `"wave"`：一個波次一組（需要 `wave_m`）。
+
+結果有三層：
+
+1. 整體的概似比檢定（Andersen, 1973）：有沒有任何步驟不同？（`print(d)` 印出來，數字在 `attr(d, "lrtest")`）
+2. 每一步的 Wald $z$：哪一步不同？（`attr(d, "diff")`）
+3. 兩組時，每一題的 DIF（Bechger & Maris, 2015），和它的整體檢定（`attr(d, "overall")`）。
+
+### 4.2 概似比檢定
+
+條件概似只和步驟參數有關，所以每組的能力分布不同也沒關係。
+每組自己校準，和全部一起校準比：
+
+$$
+\log L_g = \sum_{p \in g} \log P(\mathbf{x}_p \mid r_p; \boldsymbol\beta_g),\quad
+LR = 2\Big(\sum_g \log L_g - \log L_{\text{all}}\Big),\quad
+df = \sum_g (S_g - c_g) - (S - 1)
+$$
+
+```latex
+\log L_g = \sum_{p \in g} \log P(\mathbf{x}_p \mid r_p; \boldsymbol\beta_g),\quad
+LR = 2\Big(\sum_g \log L_g - \log L_{\text{all}}\Big),\quad
+df = \sum_g (S_g - c_g) - (S - 1)
+```
+
+* $S_g$：組 $g$ 估的步驟數；$c_g$：它分成幾片沒有共同題的題組（通常 1）；$S$：全部一起的步驟數。
+* 一組裡沒有人到達（或每個人都到達）的步驟，這組不估，也不算進自由度（`unobserved = "steps"`）。
+* `"raw"`：$r_p$ 不大於自己作答組合的中位數是低分組（同分歸低分，和 eRm 相同）。
+  用一個總的中位數，短題本的孩子幾乎都進低分組，比的就變成題本了。
+
+手算：`algo_cml()` 的 `nll` 是 $-\log L$。
+
+```{r}
+sex <- setNames(persons$sex, persons$visit_id)
+boy <- sex[rownames(X03)] == "boy"
+nll_of <- function(rows) (kits_stats(X03[rows, ]) |> algo_cml())$nll
+LR_hand <- 2 * (cml03$nll - nll_of(boy) - nll_of(!boy))
+df_hand <- 2 * (nrow(cml03$coef) - 1) - (nrow(cml03$coef) - 1)
+c(LR = LR_hand, df = df_hand, p = pchisq(LR_hand, df_hand, lower.tail = FALSE))
+```
+
+kits 的 LR 檢定，`print(d)` 印在最前面；數字在 `attr(d, "lrtest")`，和手算比：
+
+```{r}
+dif03 <- kits_dif(X03, sex)
+dif03
+lr03 <- attr(dif03, "lrtest")
+c(LR = same(LR_hand, lr03$LR), df = df_hand == lr03$df)
+```
+
+$p$ 約 `r round(lr03$p, 3)`：有步驟不同（模擬時 lan02 對女孩比較難）。
+
+`"raw"` 的分組自己做一次，當成向量交給 `kits_dif()`，得到同一個檢定。
+`"wave"` 和「給每列的波次」也一樣：
+
+```{r}
+raw_group <- mutate(by_person, group = if_else(raw <= median(raw), "low", "high"), .by = pattern)
+g_raw <- raw_group$group[match(rownames(X03), raw_group$visit_id)]
+lr_raw <- attr(kits_dif(X03, "raw"), "lrtest")
+lr_wave <- attr(kits_dif(X03, "wave", persons = persons), "lrtest")
+c(raw = same(attr(kits_dif(X03, g_raw), "lrtest")$LR, lr_raw$LR),
+  wave = same(attr(kits_dif(X03, w03), "lrtest")$LR, lr_wave$LR))
+c(raw = lr_raw$p, wave = lr_wave$p)
+```
+
+高低分、波次之間，步驟參數沒有明顯不同：PCM 在這份資料上成立。
+
+### 4.3 每一步的 Wald z
+
+整體檢定只說「有」。
+要知道是哪一步，比較每一步在兩組的 $\beta$：
+
+$$
+d_s = \hat\beta_{s,h} - \hat\beta_{s,g},\quad
+z_s = d_s \big/ \sqrt{\mathrm{SE}_{s,g}^2 + \mathrm{SE}_{s,h}^2}
+$$
+
+```latex
+d_s = \hat\beta_{s,h} - \hat\beta_{s,g},\quad
+z_s = d_s \big/ \sqrt{\mathrm{SE}_{s,g}^2 + \mathrm{SE}_{s,h}^2}
+```
+
+每組先平移，使它的 $\beta$ 的平均等於全部一起的校準在同樣步驟的平均。
+這裡兩組都估了每一步，兩邊的和都是 0，所以平移是 0。
+
+```{r}
+coef_of <- function(rows) (kits_stats(X03[rows, ]) |> algo_cml())$coef
+z_hand <- inner_join(coef_of(boy), coef_of(!boy), by = c("item_id", "item_score"),
+                     suffix = c("_boy", "_girl")) |>
+  mutate(diff = beta_girl - beta_boy, z = diff / sqrt(se_boy^2 + se_girl^2))
+c(diff = same(z_hand$diff, attr(dif03, "diff")$diff), z = same(z_hand$z, attr(dif03, "diff")$z))
+```
+
+差最大的步驟：
+
+```{r}
+z_hand |>
+  slice_max(abs(z), n = 3) |>
+  select(item_id, item_score, diff, z)
+```
+
+人數多時，看 $|d_s|$（logit）的大小，不只看 $p$。
+
+### 4.4 每一題的 DIF（兩組）
+
+兩組時，`kits_dif()` 的表是每一題的 `dif`。
+每組各自校準，原點各自不同，所以只能比「相對」的難度（Bechger & Maris, 2015）。
+兩個步驟的差 $\beta_i - \beta_j$ 和原點無關：
+
+$$
+\Delta_{ij} = \big(\beta_i^{(f)} - \beta_j^{(f)}\big) - \big(\beta_i^{(r)} - \beta_j^{(r)}\big),\quad
+\mathit{dif}_{ig} = -\tfrac{1}{S}\textstyle\sum_j \Delta_{(ig)j}
+= \big(\beta_{ig}^{(r)} - \bar\beta^{(r)}\big) - \big(\beta_{ig}^{(f)} - \bar\beta^{(f)}\big),\quad
+\mathit{dif}_i = \tfrac{1}{m_i}\textstyle\sum_g \mathit{dif}_{ig}
+$$
+
+```latex
+\Delta_{ij} = \big(\beta_i^{(f)} - \beta_j^{(f)}\big) - \big(\beta_i^{(r)} - \beta_j^{(r)}\big),\quad
+\mathit{dif}_{ig} = -\tfrac{1}{S}\textstyle\sum_j \Delta_{(ig)j}
+= \big(\beta_{ig}^{(r)} - \bar\beta^{(r)}\big) - \big(\beta_{ig}^{(f)} - \bar\beta^{(f)}\big),\quad
+\mathit{dif}_i = \tfrac{1}{m_i}\textstyle\sum_g \mathit{dif}_{ig}
+```
+
+整體檢定（有沒有任何一題有 DIF）：
+
+$$
+\chi^2 = d^\top \big(C(V^{(1)} + V^{(2)})C\big)^{-1} d,\quad
+d = C\big(\hat\beta^{(1)} - \hat\beta^{(2)}\big) \text{ without its first step},\quad
+C = I - \mathbf{1}\mathbf{1}^\top/S,\quad df = S - 1
+$$
+
+```latex
+\chi^2 = d^\top \big(C(V^{(1)} + V^{(2)})C\big)^{-1} d,\quad
+d = C\big(\hat\beta^{(1)} - \hat\beta^{(2)}\big) \text{ without its first step},\quad
+C = I - \mathbf{1}\mathbf{1}^\top/S,\quad df = S - 1
+```
+
+* $r$ 是 `ref`（預設 boy），$f$ 是另一組；正的 `dif` 表示對 `ref` 比較難，也就是有利 $f$。
+* 只比兩組都有、分數也相同的題。
+* $C$ 把比較的步驟置中；有題目沒比時，兩組的原點才不同，$C$ 才有作用。
+
+手算：每一步減去自己這組的平均，相減，按題平均。
+
+```{r}
+fit_boy <- kits_stats(X03[boy, ]) |> algo_cml()
+fit_girl <- kits_stats(X03[!boy, ]) |> algo_cml()
+by_step <- (fit_boy$coef$beta - mean(fit_boy$coef$beta)) -
+  (fit_girl$coef$beta - mean(fit_girl$coef$beta))
+dif_hand <- tibble(item_id = fit_boy$coef$item_id, dif = by_step) |>
+  summarise(dif = mean(dif), .by = item_id)
+same(dif_hand$dif, dif03$dif)
+```
+
+整體檢定：
+
+```{r}
+S <- length(by_step)
+C <- diag(S) - matrix(1 / S, S, S)
+d <- drop(C %*% (fit_boy$coef$beta - fit_girl$coef$beta))
+V <- C %*% (fit_boy$vcov + fit_girl$vcov) %*% t(C)
+chi2 <- drop(t(d[-1]) %*% solve(V[-1, -1]) %*% d[-1])
+same(c(chi2, S - 1), unlist(attr(dif03, "overall"))[1:2])
+```
+
+kits 的表：
+
+```{r}
+dif03
+```
+
+模擬時 lan02 對女孩難 0.8，所以 lan02 是負的（有利男孩）。
+其他題的 `dif` 只是抽樣誤差；每組只有約 300 個孩子，它也可能超過 0.3（例如 lan04）。
+所以先看整體檢定，再看單題。
+
+### 4.5 看圖：每組實際的通過率
+
+數字之外，也可以直接看資料。
+`plot(item, type = "observed")` 把每一題的實際通過率對 $\hat\theta$ 畫出來，一組一條線（van Buuren & Eekhout, 2021 的等化組經驗曲線）：
+
+* $\hat\theta$ 是 `kits_subj()` 的 WLE，每 0.5 logit 一段，一段至少 10 人才畫。
+* 灰色虛線是模型的 $P(X \ge \text{step} \mid \theta)$，`step` 和 `kits_item_table(step = )` 相同。
+* 上方的短線是通過的孩子的 $\hat\theta$，下方是沒通過的。
+* 右下角是這題在這份資料上的 infit 和 outfit。
+
+```{r}
+#| fig-height: 4
+plot(item03, type = "observed", data = X03, group = sex, items = c("lan01", "lan02", "lan03"))
+```
+
+lan02 的女孩（橘）在同樣的 $\hat\theta$ 通過得比較少，線在灰線的右邊；男孩在左邊。
+兩組的 $\hat\theta$ 來自同一個校準，所以模型線是兩組的平均；DIF 讓兩條線分開，大小大約是 4.4 的 `dif`。
+其他兩題的兩條線都貼著灰線。
+
+一條線的一個點，自己算一次：男孩、lan01、$\hat\theta$ 在 $[-1, -0.5)$ 的人裡通過的比例。
+
+```{r}
+th03 <- kits_subj(X03, item03)$theta
+in_bin <- boy & th03 >= -1 & th03 < -0.5 & !is.na(X03[, "lan01"])
+c(n = sum(in_bin), pass = mean(X03[in_bin, "lan01"] >= 1))
+```
+
+點畫在這一段的人的平均 $\hat\theta$（$-0.67$），不是段的中點 $-0.75$。
+把滑鼠移到藍線 $\hat\theta = -0.67$ 的點上，人數和比例和這裡相同。
+`group = "wave"` 就是每個波次一條線，用來看共同題在各波次是否一樣。
+
+### 4.6 兩個世代合起來：`kits_dif_combine()`
+
+兩個世代各算一次，再合起來判斷：
+
+* 大於 `cut`（預設 0.3 logit）有利焦點組，小於 `-cut` 有利參照組，其他是 none。
+* 只有一個世代有的題：用那個世代的。
+* 兩邊方向相反、有一邊超過 `cut`：inconsistent。
+* 其他：超過 `cut` 的那個方向，或 none。
+
+```{r}
+dif36 <- kits_dif(X36, sex)
+dif_both <- kits_dif_combine(dif03, dif36)
+dif_both
+```
+
+照規則自己判斷一次（`.x` 是 M03，`.y` 是 M36）：
+
+```{r}
+dir_of <- function(v) {
+  case_when(v > 0.3 ~ "favors girls", v < -0.3 ~ "favors boys", .default = "none")
+}
+```
+
+```{r}
+combined <- full_join(as_tibble(dif03), as_tibble(dif36), by = "item_id") |>
+  mutate(d1 = dir_of(dif.x), d2 = dir_of(dif.y),
+         DIF = case_when(is.na(dif.y) ~ d1, is.na(dif.x) ~ d2,
+                         d1 == "none" & d2 == "none" ~ "none", dif.x * dif.y < 0 ~ "inconsistent",
+                         d1 != "none" ~ d1, .default = d2))
+identical(combined$DIF, dif_both$DIF)
+```
+
+`DIF` 欄交給題目表 `kits_item_table(dif = )`，它的 `plot()` 用這一欄給題目上色。
+
+### 4.7 教學程式：`dif.R`
+
+`dif.R` 不用 kits，自己寫一組的 CML（RTMB），再做第 4.4 節。
+它分三段：`cml`、`dif`、`overall`。
+`dif` 段：
+
+```{r}
+#| output: asis
+script_part("dif.R", "dif")
+```
+
+整份在示範資料 `kitm03` 的語言上執行；最後的 `compare` 段自己和 `kits_dif()` 比：
+
+```{r}
+env_dif <- run_script("dif.R")
+env_dif$diffs
+all(env_dif$diffs < 1e-6)
+```
+
+要用自己的資料，換掉它的 `inputs` 段（`X`、`sex`、`ref`）。
+
+## 5 偏移：`kits_drift()`
+
+### 5.1 做什麼用
+
+新的一波資料要用固定參數校準之前，先看哪些題變了。
+`kits_drift(X_new, ref)` 就是兩步：
+
+1. 新資料自己校準（`kits_item()`，不固定任何題）。
+2. 把能判斷的步驟的門檻，用 mean/sigma 線接到 `ref`，篩一次（`kits_linking()`，[03](03_linking.html)）。
+
+被篩掉的步驟，它的題就是偏移。
+沒有偏移的題，建議下一次校準時固定（`drift$fix`）。
+
+### 5.2 公式
+
+$$
+\begin{aligned}
+&\text{step } ik \text{ judged} \iff \min(n^{<}_{ik}, n^{\ge}_{ik}) \ge \mathit{min\_n}\\
+&\mathit{thr}^{\mathrm{ref}}_{ik} = B + A\,\mathit{thr}^{\mathrm{new}}_{ik},\quad
+A = \frac{\mathrm{SD}(\mathrm{ref})}{\mathrm{SD}(\mathrm{new})},\quad
+B = \overline{\mathrm{ref}} - A\,\overline{\mathrm{new}}\\
+&\mathit{drift}_i \iff \exists k: |e_{ik}| > \mathit{cut}\cdot\mathrm{SD}(e)
+\end{aligned}
+$$
+
+```latex
+\begin{aligned}
+&\text{step } ik \text{ judged} \iff \min(n^{<}_{ik}, n^{\ge}_{ik}) \ge \mathit{min\_n}\\
+&\mathit{thr}^{\mathrm{ref}}_{ik} = B + A\,\mathit{thr}^{\mathrm{new}}_{ik},\quad
+A = \frac{\mathrm{SD}(\mathrm{ref})}{\mathrm{SD}(\mathrm{new})},\quad
+B = \overline{\mathrm{ref}} - A\,\overline{\mathrm{new}}\\
+&\mathit{drift}_i \iff \exists k: |e_{ik}| > \mathit{cut}\cdot\mathrm{SD}(e)
+\end{aligned}
+```
+
+* $n^{<}_{ik}$、$n^{\ge}_{ik}$：新資料裡這一題得分低於 $k$、至少 $k$ 的人數；`min_n` 預設 30。
+* $e_{ik}$：第一次的線（所有判斷的點）的殘差；`cut` 預設 2。
+* 篩掉以後，用留下的點再畫一次線。
+* 建議固定：判斷過而沒有偏移，或資訊太少不能判斷，或新資料裡沒有 0 分、只有一種分數。
+* 新資料的最高分比 `ref` 高的題不判斷：門檻由這題所有的步驟一起決定，多一個步驟，舊步驟的門檻也會變。
+  它也建議固定：`kits_item(fixed_params = )` 固定它舊的步驟（`beta` 不變），只估新的步驟。
+
+### 5.3 資料
+
+新的一波：400 個孩子答 lan01–lan08，能力比較高。
+lan04 在新資料裡難了 1.5 logit：
+
+```{r}
+betas_new <- modifyList(betas, list(lan04 = betas$lan04 + 1.5))
+X_new <- kits_sim(rnorm(400, 0.5, 1), betas_new[1:8], seed = 3)
+drift_new <- kits_drift(X_new, item03)
+drift_new
+```
+
+### 5.4 手算，用 `algo_` 的元件
+
+第 1 步：新資料自由校準，門檻用 `algo_thresholds()`。
+
+```{r}
+free <- kits_stats(X_new) |>
+  algo_cml() |>
+  algo_thresholds()
+identical(free$thr, drift_new$steps_free$thr)
+```
+
+第 2 步：兩邊都有的步驟，數一數每一步上下各幾個人：
+
+```{r}
+n_at <- function(i, k, below) sum(if (below) X_new[, i] < k else X_new[, i] >= k)
+points <- free |>
+  select(item_id, item_score, thr_new = thr) |>
+  inner_join(select(coef(item03), item_id, item_score, thr_ref = thr),
+             by = c("item_id", "item_score")) |>
+  mutate(n_below = map2_dbl(item_id, item_score, n_at, below = TRUE),
+         n_above = map2_dbl(item_id, item_score, n_at, below = FALSE),
+         judged = pmin(n_below, n_above) >= 30)
+```
+
+第 3 步：判斷的步驟，篩一次（`algo_screen()`），再畫線（`algo_mean_sigma()`）：
+
+```{r}
+use <- filter(points, judged)
+screen <- algo_screen(use$thr_new, use$thr_ref, cut = 2)
+line <- algo_mean_sigma(screen)
+c(intercept = identical(line$intercept, drift_new$intercept),
+  slope = identical(line$slope, drift_new$slope))
+```
+
+第 4 步：被篩掉的步驟屬於哪一題：
+
+```{r}
+use$item_id[screen$dropped]
+filter(drift_new$items, drift %in% TRUE)$item_id
+```
+
+`kits_drift()` 的第 2 步就是 `kits_linking()`，給它兩張門檻表：
+
+```{r}
+link_new <- kits_linking(select(use, item_id, item_score, thr = thr_new),
+                         select(use, item_id, item_score, thr = thr_ref), cut = 2)
+c(identical(link_new$intercept, drift_new$intercept), identical(link_new$slope, drift_new$slope))
+```
+
+### 5.5 下一次校準
+
+建議固定的題（`drift$fix`）放進 `fixed_params`。
+新的校準就在 `ref` 的量尺上，偏移的 lan04 自己估：
+
+```{r}
+item_new <- kits_item(X_new, fixed_params = drift_new$fix)
+coef(item_new) |>
+  filter(item_id %in% c("lan03", "lan04")) |>
+  select(item_id, item_score, beta, beta_se, thr)
+```
+
+固定的步驟 SE 是 0。
+偏移的題怎麼讀、建議固定哪些題，見 `vignette("kits-advanced", package = "kits")` 的第 8.1、8.2 節。
+
+### 5.6 教學程式：`drift.R`
+
+`drift.R` 分三段：`points`（第 1–2 步）、`line`（第 3 步）、`items`（第 4–5 步）。
+`line` 段就是 mean/sigma 和篩一次：
+
+```{r}
+#| output: asis
+script_part("drift.R", "line")
+```
+
+它在示範資料上比較 `kitm36` 和 `kitm03` 的語言；最後自己和 `kits_drift()` 比：
+
+```{r}
+env_drift <- run_script("drift.R")
+env_drift$diffs
+identical(env_drift$items$drift, env_drift$want$items$drift)
+```
+
+## 6 可以重做的流程
+
+下面兩個區塊，貼到一個新的 R（只有 `library(kits)`）就能重做。
+它們只用 base R 和 kits。
+這份文件也在一個新的 R 裡執行它們（`run_fresh()`），和這裡的結果比。
+
+### 6.1 LR 檢定和性別 DIF
+
+```{r pipe-dif}
+betas_p <- list(a1 = c(-1, 0), a2 = c(0, 1), a3 = 0.5, a4 = -0.5, a5 = c(-0.5, 0.5))
+theta_p <- seq(-3, 3, length.out = 300)
+boys <- kits_sim(theta_p, betas_p, prefix = "b", seed = 1)
+girls <- kits_sim(theta_p, modifyList(betas_p, list(a4 = 0.5)), prefix = "g", seed = 2)
+sex_p <- rep(c("boy", "girl"), each = 300)
+dif_p <- kits_dif(rbind(boys, girls), sex_p)
+list(lrtest = attr(dif_p, "lrtest")[c("LR", "df", "p")], dif = dif_p$dif)
+```
+
+```{r}
+fresh_dif <- run_fresh("pipe-dif")
+identical(fresh_dif, list(lrtest = attr(dif_p, "lrtest")[c("LR", "df", "p")], dif = dif_p$dif))
+```
+
+a4 對女孩難 1 logit，所以 a4 的 `dif` 是負的。
+
+### 6.2 偏移，再固定
+
+```{r pipe-drift}
+betas_q <- list(a1 = c(-1, 0), a2 = c(0, 1), a3 = 0.5, a4 = -0.5, a5 = c(-0.5, 0.5), a6 = 1.5)
+old <- kits_sim(seq(-3, 3, length.out = 400), betas_q, seed = 1)
+new <- kits_sim(seq(-2, 4, length.out = 400), modifyList(betas_q, list(a3 = 2)),
+                prefix = "n", seed = 2)
+drift_q <- kits_drift(new, kits_item(old))
+item_q <- kits_item(new, fixed_params = drift_q$fix)
+list(items = as.data.frame(drift_q$items), thr = coef(item_q)$thr)
+```
+
+```{r}
+fresh_drift <- run_fresh("pipe-drift")
+identical(fresh_drift, list(items = as.data.frame(drift_q$items), thr = coef(item_q)$thr))
+```
+
+## 7 下一步
+
+* [06 量尺](06_scale.html)：訊息、精準度、原始分對照、垂直量尺、連結檢查，和 kitsPreview 比。
+* [07 分量表分數](07_subscales.html)：共同量尺上的分量表分數、它的 SE、成長模型和模擬。
+* 模型的程式（CML、ESF、gamma 的 SE）：[kits 的模型](../tutorial_models/kits_models.html)。
+
+全部算完的時間：
+
+```{r}
+round(difftime(Sys.time(), t_start, units = "secs"))
+```
+
+## 參考文獻
+
+* Andersen, E. B. (1973). A goodness of fit test for the Rasch model. *Psychometrika, 38*, 123-140. doi:10.1007/BF02291180
+* Bechger, T. M., & Maris, G. (2015). A statistical test for differential item pair functioning. *Psychometrika, 80*(2), 317-340. doi:10.1007/s11336-014-9408-y
+* Benjamini, Y., & Hochberg, Y. (1995). Controlling the false discovery rate: a practical and powerful approach to multiple testing. *Journal of the Royal Statistical Society B, 57*(1), 289-300.
+* Christensen, K. B., Kreiner, S., & Mesbah, M. (Eds.). (2013). *Rasch models in health*. ISTE and Wiley.
+* Goodman, L. A., & Kruskal, W. H. (1972). Measures of association for cross classifications, IV: Simplification of asymptotic variances. *Journal of the American Statistical Association, 67*(338), 415-421.
+* Kolen, M. J., & Brennan, R. L. (2014). *Test equating, scaling, and linking* (3rd ed.). Springer. doi:10.1007/978-1-4939-0317-7
+* Kreiner, S. (2011). A note on item-restscore association in Rasch models. *Applied Psychological Measurement, 35*(7), 557-561.
+* Kreiner, S., & Christensen, K. B. (2011). Exact evaluation of bias in Rasch model residuals. *Advances in Mathematics Research, 12*, 19-40.
+* Linacre, J. M. (2002). What do infit and outfit, mean-square and standardized mean? *Rasch Measurement Transactions, 16*(2), 878.
+* Maris, G., Bechger, T., Koops, J., & Partchev, I. (2026). dexter: Data management and analysis of tests (R package version 1.8.1).
+* Marco, G. L. (1977). Item characteristic curve solutions to three intractable testing problems. *Journal of Educational Measurement, 14*(2), 139-160. doi:10.1111/j.1745-3984.1977.tb00033.x
+* Müller, M. (2020). Item fit statistics for Rasch analysis: can we trust them? *Journal of Statistical Distributions and Applications, 7*, 5. doi:10.1186/s40488-020-00108-7
+* van Buuren, S., & Eekhout, I. (2021). Child development with the D-score: Turning milestones into measurement. *Gates Open Research, 5*, 81. doi:10.12688/gatesopenres.13222.1
+* Wright, B. D., & Linacre, J. M. (1994). Reasonable mean-square fit values. *Rasch Measurement Transactions, 8*(3), 370.
+* Wright, B. D., & Masters, G. N. (1982). *Rating scale analysis*. MESA Press.

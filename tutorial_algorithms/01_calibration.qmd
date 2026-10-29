@@ -1,0 +1,942 @@
+---
+title: "校準：從作答到門檻"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    embed-resources: true
+    grid:
+      body-width: 1100px
+from: markdown+east_asian_line_breaks
+---
+
+```{=html}
+<style>
+.MathJax_Display, mjx-container { overflow-x: auto; overflow-y: hidden; }
+</style>
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+options(width = 100)
+t_start <- Sys.time()
+```
+
+## 0 這份教學
+
+### 你會學到什麼
+
+`kits_item()` 一步做完校準。
+這份教學把它拆開，一步一步看。
+
+1. 資料：作答的三種形式（第 1 節）。
+2. 充分統計量：CML 只需要兩種人數（第 2 節）。
+3. PCM：一題每個分數的機率（第 3 節）。
+4. ESF：給定原始分，把 $\theta$ 消掉的分母（第 4 節）。
+5. CML：條件最大概似，估步驟參數 $\beta$（第 5 節）。
+6. $\beta$ 的共變異數和 SE（第 6 節）。
+7. 門檻和它的 SE（第 7 節）。
+8. 固定題（第 8 節）。
+9. 貼到新的 R 就能重做的管線（第 9 節）。
+
+每一節都照同樣的順序：
+
+* 這一步做什麼（白話）。
+* 公式：排好的數學式，和一模一樣的 LaTeX（右上角的按鈕一鍵複製）。
+* 手算：在模擬資料上，用 base R 照公式自己算一次。
+* 用 kits 算：`kits_` 一層和 `algo_` 一層各算一次，和手算比。
+* 教學程式：套件裡的 `.R` 檔是哪一段；便宜的就直接跑。
+
+### 你需要什麼
+
+* R 和 kits。整理資料用 dplyr、tidyr、purrr、tibble。
+* 知道矩陣、`|>` 和一點機率。
+* 不需要先懂 IRT：每個符號第一次出現時都會說。
+
+模型本身在 RTMB 裡怎麼寫，在另一份教學 [kits 的模型](../tutorial_models/kits_models.html)。
+這份教學需要時指過去，不重複。
+
+```{r, message = FALSE}
+library(kits)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+```
+
+### 這個算法的總覽
+
+`kits_algorithm()` 用三十行左右說：一個結果是哪個算法算的、幾步、每步一條式子、兩層的函數、文獻、教學程式在哪裡。
+
+```{r}
+kits_algorithm("cml")
+```
+
+這份教學的第 2–7 節，就是這六步。
+`Components` 的兩條管線，第 9 節會在新的 R 裡重做一次。
+
+### 三個小工具
+
+教學程式用 `# ==== part: 名字 ====` 分段。
+`script_part()` 讀出一段（或 `inputs`、`compare` 段）：
+
+```{r}
+script_part <- function(file, part) {
+  code <- readLines(system.file("scripts", file, package = "kits"))
+  marks <- grep("^# ==== ", code)
+  start <- grep(sprintf("^# ==== (part: )?%s ====", part), code)
+  end <- c(marks[marks > start], length(code) + 1)[1] - 1
+  code[start:end]
+}
+```
+
+`run_parts()` 在一個新的環境裡跑幾段。
+它先跑程式開頭的 `library()`，再跑那幾段；`...` 放進要用的物件（例如自己的 `X`）。
+
+```{r}
+run_parts <- function(file, parts, ...) {
+  code <- readLines(system.file("scripts", file, package = "kits"))
+  top <- code[seq_len(grep("^# ==== inputs ====", code) - 1)]
+  env <- list2env(list(...), envir = new.env(parent = globalenv()))
+  body <- unlist(map(parts, \(p) script_part(file, p)))
+  printed <- capture.output(suppressMessages(eval(parse(text = c(top, body)), envir = env)))
+  env
+}
+```
+
+`same_cols()` 一欄一欄用 `identical()` 比兩個表。
+kits 的表另外帶著量尺標籤和資料的指紋（屬性），所以只比欄位的數字。
+
+```{r}
+same_cols <- function(a, b, cols = names(a)) {
+  map_lgl(set_names(cols), \(v) identical(a[[v]], b[[v]]))
+}
+```
+
+第 9 節還有一個 `run_fresh()`：在一個全新的 R 裡跑一段程式。
+
+
+## 1 資料
+
+### 做什麼
+
+校準的輸入只有作答。
+一列是一個孩子的一次施測（人次），一欄是一題，NA 是沒有施測。
+
+### 模擬資料
+
+一個領域（語言），8 題，由易到難。
+第 1、4 題是兩點計分（0、1），其他是三點計分（0、1、2）。
+
+```{r data-betas}
+set.seed(7)
+b <- seq(-2.5, 2, length.out = 8)
+betas <- lapply(b, \(x) x + c(-0.5, 0.5))
+betas[c(1, 4)] <- b[c(1, 4)]
+names(betas) <- sprintf("lan%02d", 1:8)
+```
+
+三個波次（6、12、24 個月），每個波次 200 個孩子。
+能力隨月齡的對數成長。
+`kits_sim()` 照 PCM 抽出作答。
+
+```{r data-x}
+wave_m <- rep(c(6, 12, 24), each = 200)
+age_m <- wave_m + runif(600, -1, 1)
+theta <- 1.8 * log(age_m / 12) + rnorm(600, 0, 0.9)
+X <- kits_sim(theta, betas)
+```
+
+三個波次答的題目不一樣。
+6 個月不答第 7、8 題，24 個月不答第 1、2 題。
+12 個月有 10 個孩子漏答第 8 題。
+
+```{r data-na}
+X[wave_m == 6, c("lan07", "lan08")] <- NA
+X[wave_m == 24, c("lan01", "lan02")] <- NA
+X[which(wave_m == 12)[1:10], "lan08"] <- NA
+```
+
+每個波次、每個答題數的人數：
+
+```{r}
+tibble(wave_m, n_items = rowSums(!is.na(X))) |>
+  count(wave_m, n_items)
+```
+
+這份資料只用 base R 和 kits 做。
+所以第 9 節可以把它原封不動貼到新的 R 裡。
+
+### 三種形式給同樣的校準
+
+作答可以是矩陣、寬的 data.frame，或長的 data.frame（`visit_id`、`item_id`、`item_score`）。
+
+```{r}
+wide <- as_tibble(X, rownames = "visit_id")
+long <- wide |>
+  pivot_longer(-visit_id, names_to = "item_id", values_to = "item_score",
+               values_drop_na = TRUE)
+```
+
+三種形式的 $\beta$ 一模一樣：
+
+```{r, message = FALSE}
+beta_matrix <- coef(kits_item(X))$beta
+c(wide = identical(coef(kits_item(wide))$beta, beta_matrix),
+  long = identical(coef(kits_item(long))$beta, beta_matrix))
+```
+
+這份教學從頭到尾用的校準：
+
+```{r}
+item <- kits_item(X, scale = "lan sim")
+cf <- coef(item)
+item
+```
+
+一列是一題的一個步驟。
+`beta` 是步驟參數，`thr` 是門檻。
+
+### 示範資料
+
+教學程式（`inst/scripts`）的 `inputs` 段用套件的示範資料 `kitm03`。
+它是從真實 KIT 資料的彙總數字模擬出來的，裡面沒有真的孩子。
+這份教學的手算用上面的模擬資料；跑教學程式時，有時用示範資料，有時換成自己的 `X`。
+
+
+## 2 充分統計量
+
+### 做什麼
+
+CML 不需要每個孩子的整串作答。
+它只需要兩種人數：
+
+* 每一題的每一步，有幾個人到達（分數至少是 $g$）。
+* 每個作答組合（一組答過的題目）裡，每個原始分有幾個人。
+
+這兩種人數叫充分統計量：有了它們，概似函數就完全決定了。
+
+### 公式
+
+$$
+n_{ig} = \#\{p : x_{pi} \ge g\}, \qquad n_{br} = \#\{p \in b : r_p = r\}
+$$
+
+```latex
+n_{ig} = \#\{p : x_{pi} \ge g\}, \qquad n_{br} = \#\{p \in b : r_p = r\}
+```
+
+* $x_{pi}$：孩子 $p$ 在題目 $i$ 的分數。
+* $g$：步驟，$g = 1, \dots, m_i$；$m_i$ 是題目 $i$ 的最高分。
+* $b$：作答組合（item pattern）。
+* $r_p$：原始分，答過的題目分數加起來。
+
+### 手算
+
+$n_{ig}$：一題一步，數分數至少是 $g$ 的人。
+
+```{r}
+st <- kits_stats(X)
+n_ig <- map2_int(st$steps$item_id, st$steps$item_score,
+                 \(i, g) sum(X[, i] >= g, na.rm = TRUE))
+head(n_ig)
+```
+
+$n_{br}$：先找出每個孩子的作答組合和原始分。
+
+```{r}
+pattern <- apply(!is.na(X), 1, \(z) paste(colnames(X)[z], collapse = " "))
+r <- rowSums(X, na.rm = TRUE)
+n_br <- tibble(pattern, r) |>
+  count(pattern, r)
+head(n_br)
+```
+
+### 用 kits 算
+
+`kits_stats()` 是校準的第 1 步。
+`kits_item()` 把它留在 `item$stats`。
+
+```{r}
+st
+```
+
+手算和 `kits_stats()` 一樣：
+
+```{r}
+c(n_ig = identical(n_ig, st$steps$n),
+  n_persons = identical(sum(n_br$n), st$n_persons),
+  in_item = identical(st$steps, item$stats$steps))
+```
+
+`st$raw` 一列是一個作答組合的一個原始分（0 到滿分，沒有人的也列出來）。
+有人的格子和手算的 $n_{br}$ 相同：
+
+```{r}
+st_raw <- st$raw |>
+  filter(n > 0)
+identical(sort(st_raw$n), sort(n_br$n))
+```
+
+`algo_` 一層沒有自己的統計量函數。
+它從 `kits_stats()` 的結果開始（第 5 節的 `algo_cml(st)`）。
+
+### 教學程式
+
+`cml.R` 的 `stats` 段做同樣的事：`n_ge` 是 $n_{ig}$，`patterns$n_raw` 是 $n_{br}$。
+
+```{r, code = script_part("cml.R", "stats"), eval = FALSE}
+```
+
+
+## 3 PCM：一題每個分數的機率
+
+### 做什麼
+
+partial credit model（PCM；Masters, 1982）說：能力 $\theta$ 的孩子，在一題得 $k$ 分的機率是多少。
+每一步 $g$ 有一個步驟參數 $\beta_{ig}$。
+$\theta$ 比 $\beta_{ig}$ 大越多，越可能走過這一步。
+
+### 公式
+
+$$
+P(X_{pi} = k \mid \theta_p) =
+\frac{\exp\big(k\theta_p - \sum_{g=1}^{k}\beta_{ig}\big)}
+     {\sum_{h=0}^{m_i}\exp\big(h\theta_p - \sum_{g=1}^{h}\beta_{ig}\big)}
+$$
+
+$$
+E_i(\theta) = \sum_k k\,P_{ik}, \qquad
+I_i(\theta) = \mathrm{Var}_i(\theta) = \sum_k (k - E_i)^2 P_{ik}
+$$
+
+```latex
+P(X_{pi} = k \mid \theta_p) =
+\frac{\exp\big(k\theta_p - \sum_{g=1}^{k}\beta_{ig}\big)}
+     {\sum_{h=0}^{m_i}\exp\big(h\theta_p - \sum_{g=1}^{h}\beta_{ig}\big)}
+
+E_i(\theta) = \sum_k k\,P_{ik}, \qquad
+I_i(\theta) = \mathrm{Var}_i(\theta) = \sum_k (k - E_i)^2 P_{ik}
+```
+
+* 分子的 $\sum_{g \le k}\beta_{ig}$：走到 $k$ 分要走過的步驟（$k = 0$ 時是 0）。
+* $E_i$：這一題的期望分數。
+* $I_i$：這一題的訊息量，就是分數的變異數。
+  計分（[02_scoring](02_scoring.html)）會用到它。
+
+### 手算
+
+照公式寫，一行算出所有分數的機率：
+
+```{r}
+pcm <- function(theta, beta) {
+  eta <- c(0, cumsum(theta - beta))
+  exp(eta) / sum(exp(eta))
+}
+```
+
+lan02（三點計分）在 $\theta = 0.5$：
+
+```{r}
+b02 <- cf$beta[cf$item_id == "lan02"]
+P <- pcm(0.5, b02)
+k <- seq_along(P) - 1
+c(P = P, E = sum(k * P), Var = sum((k - sum(k * P))^2 * P))
+```
+
+### 用 kits 算
+
+`kits_pcm_prob()` 是給人看的一層；`algo_pcm()` 是數字進、數字出的一層。
+
+```{r}
+pp <- kits_pcm_prob(item, 0.5, items = "lan02")
+ap <- algo_pcm(0.5, b02)
+c(P = identical(ap$P[1, ], pp$prob$prob),
+  E = identical(ap$E, pp$moments$expected),
+  Var = identical(ap$Var, pp$moments$variance),
+  by_hand = isTRUE(all.equal(P, ap$P[1, ], tolerance = 1e-12)))
+```
+
+手算和 kits 只差浮點的捨入：kits 先減掉最大的指數，避免溢位。
+
+整份測驗的期望分數和訊息，加起來就是 `kits_expected_score()` 和 `kits_information()`：
+
+```{r}
+th <- c(-2, 0, 2)
+info <- map(split(cf$beta, cf$item_id), \(b) algo_pcm(th, b)$Var)
+all.equal(Reduce(`+`, info), kits_information(item)(th), tolerance = 1e-12)
+```
+
+### 教學程式
+
+`information.R` 照 $\sum_i \mathrm{Var}(X_i \mid \theta)$ 算訊息；在示範資料上跑整份，它自己和 kits 比：
+
+```{r}
+env_info <- run_parts("information.R", c("inputs", "information", "expected_score", "compare"))
+env_info$diffs < 1e-10
+```
+
+
+## 4 ESF：讓能力消掉的分母
+
+### 做什麼
+
+給定原始分 $r$，一個孩子「怎麼分配」這 $r$ 分到各題，機率和 $\theta$ 無關。
+分母是所有分配方式的權重加起來，叫 elementary symmetric function（ESF），$\gamma_r$。
+每個作答組合有自己的一組 $\gamma_r$。
+
+### 公式
+
+$$
+\gamma_r = [z^r]\prod_i \Big(1 + \sum_{k=1}^{m_i} e^{-\sum_{g=1}^{k}\beta_{ig}} z^k\Big)
+$$
+
+```latex
+\gamma_r = [z^r]\prod_i \Big(1 + \sum_{k=1}^{m_i} e^{-\sum_{g=1}^{k}\beta_{ig}} z^k\Big)
+```
+
+* $[z^r]$：多項式裡 $z^r$ 的係數。
+* 一題一個多項式；乘起來，就是把所有分數組合按原始分加起來。
+* 多項式相乘就是係數的卷積，所以很快。
+
+### 手算：列出所有組合
+
+6 個月的題本有 6 題（lan01–lan06），共 $2 \times 3 \times 3 \times 2 \times 3 \times 3 = 324$ 種分數組合。
+一題得 $k$ 分的權重是 $e^{-\sum_{g \le k}\beta_{ig}}$：
+
+```{r}
+beta_of <- split(cf$beta, factor(cf$item_id, levels = unique(cf$item_id)))
+form6 <- sprintf("lan%02d", 1:6)
+weights <- map(beta_of[form6], \(b) c(1, exp(-cumsum(b))))
+grid <- expand.grid(map(weights, \(w) seq_along(w) - 1))
+nrow(grid)
+```
+
+一個組合的權重是各題權重相乘；$\gamma_r$ 是原始分 $r$ 的組合加起來：
+
+```{r}
+w_combo <- Reduce(`*`, imap(grid, \(k, i) weights[[i]][k + 1]))
+gamma_enum <- tapply(w_combo, rowSums(grid), sum)
+round(gamma_enum, 1)
+```
+
+### 手算：卷積
+
+兩個多項式相乘，就是係數的卷積：
+
+```{r}
+conv <- function(p1, p2) {
+  out <- numeric(length(p1) + length(p2) - 1)
+  for (k in seq_along(p2)) {
+    idx <- seq_along(p1) + k - 1
+    out[idx] <- out[idx] + p1 * p2[k]
+  }
+  out
+}
+```
+
+一題一題乘上去，再和列舉比：
+
+```{r}
+gamma_conv <- Reduce(conv, weights, 1)
+all.equal(unname(c(gamma_enum)), gamma_conv, tolerance = 1e-12)
+```
+
+### 用 kits 算
+
+`kits_esf()` 給一個作答組合的 $\gamma_r$；`algo_esf()` 是同一個計算，數字進、數字出：
+
+```{r}
+esf <- kits_esf(item, items = form6)
+aesf <- algo_esf(beta_of[form6])
+c(kits_vs_algo = identical(aesf$log_gamma, esf$gamma$log_gamma),
+  by_hand = isTRUE(all.equal(log(gamma_conv), esf$gamma$log_gamma, tolerance = 1e-12)))
+```
+
+kits 算的是 $\log\gamma_r$。
+題目多時 $\gamma_r$ 會下溢，所以先把 $\beta$ 減掉平均 $c$，再用 $\gamma_r(\beta) = e^{-rc}\gamma_r(\beta - c)$ 換回來。
+
+`kits_esf()` 也給條件分布 $P(X_i = x \mid r)$，不需要 $\theta$；條件式的題目適配用它（[05_checks](05_checks.html)）。
+
+### 教學程式
+
+`cml.R` 的 `cml` 段開頭是 `conv()` 和 `log_gamma()`（下一節一起看）。
+
+
+## 5 CML：條件最大概似
+
+### 做什麼
+
+給定原始分，$\theta$ 從概似消掉了。
+所以估 $\beta$ 不需要假設孩子能力的分布。
+這就是條件最大概似（CML）。
+
+### 公式
+
+$$
+P(\mathbf{x}_p \mid r_p) = \frac{\exp\big(-\sum_i\sum_{g=1}^{x_{pi}}\beta_{ig}\big)}{\gamma_{r_p}}
+$$
+
+$$
+\log L = -\sum_{i,g}\beta_{ig}\, n_{ig} - \sum_b\sum_r n_{br}\log\gamma_{br},
+\qquad \sum_i\sum_g \beta_{ig} = 0
+$$
+
+$$
+\beta = \beta_0 + A\,\eta, \qquad \eta \leftarrow \eta - H^{-1} g
+$$
+
+```latex
+P(\mathbf{x}_p \mid r_p) = \frac{\exp\big(-\sum_i\sum_{g=1}^{x_{pi}}\beta_{ig}\big)}{\gamma_{r_p}}
+
+\log L = -\sum_{i,g}\beta_{ig}\, n_{ig} - \sum_b\sum_r n_{br}\log\gamma_{br},
+\qquad \sum_i\sum_g \beta_{ig} = 0
+
+\beta = \beta_0 + A\,\eta, \qquad \eta \leftarrow \eta - H^{-1} g
+```
+
+* 第一行：一個孩子的作答，給定原始分的機率；$\theta$ 不在裡面。
+* 第二行：所有孩子加起來，只用到第 2 節的 $n_{ig}$ 和 $n_{br}$。
+* 原點：所有 $\beta$ 的和是 0（和 dexter 相同）。
+* $\eta$：要估的自由參數；$A$ 讓最後一個 $\beta$ 等於前面的負的總和。
+* $g$、$H$：$-\log L$ 對 $\eta$ 的梯度和 Hessian，由 RTMB 自動微分。
+
+### 手算：$\theta$ 真的消掉了
+
+lan01 和 lan04 兩題（都是兩點計分），原始分 1。
+「lan01 對、lan04 錯」的條件機率，在 $\theta = -1$ 和 $\theta = 2$ 一樣：
+
+```{r}
+p_cond <- function(theta) {
+  p1 <- pcm(theta, beta_of$lan01)
+  p4 <- pcm(theta, beta_of$lan04)
+  p1[2] * p4[1] / (p1[2] * p4[1] + p1[1] * p4[2])
+}
+c(theta_minus1 = p_cond(-1), theta_2 = p_cond(2))
+```
+
+### 手算：$-\log L$
+
+照第二行，從充分統計量寫 $-\log L$（base R，用第 4 節的 `conv()`）。
+先寫一個作答組合的 $\gamma_r$，和第 4 節的卷積相同：
+
+```{r}
+gamma_of <- function(bo, its) Reduce(conv, map(bo[its], \(b) c(1, exp(-cumsum(b)))), 1)
+nbr <- split(st$raw$n, factor(st$raw$pattern_id, levels = st$patterns$pattern_id))
+```
+
+$-\log L = \sum\beta_{ig}n_{ig} + \sum_b\sum_r n_{br}\log\gamma_{br}$：
+
+```{r}
+nll_beta <- function(beta) {
+  bo <- split(beta, factor(st$steps$item_id, levels = st$items))
+  log_gamma <- map(st$patterns$items, \(its) log(gamma_of(bo, its)))
+  sum(beta * st$steps$n) + sum(map2_dbl(nbr, log_gamma, \(n, l) sum(n * l)))
+}
+```
+
+在 kits 的估計上，和 kits 的 $-\log L$ 相同：
+
+```{r}
+c(by_hand = nll_beta(cf$beta), kits = item$fit$est$nll)
+```
+
+再自己找最小值。
+$\beta = A\eta$，$A$ 讓 $\sum\beta = 0$；`nlminb()` 用數值的梯度：
+
+```{r}
+S <- nrow(st$steps)
+A <- rbind(diag(S - 1), -1)
+nll_eta <- function(eta) nll_beta(drop(A %*% eta))
+ctrl <- list(rel.tol = 1e-14, eval.max = 5000, iter.max = 5000)
+opt <- nlminb(numeric(S - 1), nll_eta, control = ctrl)
+beta_hand <- drop(A %*% opt$par)
+```
+
+數值梯度只到大約 $10^{-7}$，所以在 $10^{-6}$ 以內比：
+
+```{r}
+c(sum_zero = abs(sum(beta_hand)) < 1e-12,
+  same_beta = isTRUE(all.equal(beta_hand, cf$beta, tolerance = 1e-6)))
+```
+
+### 用 kits 算
+
+`kits_cml()` 是校準的第 2 步；`algo_cml()` 是同一個最佳化，數字進、數字出。
+兩個都從第 2 節的 `st` 開始：
+
+```{r}
+fit <- kits_cml(st)
+cml <- algo_cml(st)
+c(kits_vs_algo = identical(cml$coef$beta, fit$est$beta),
+  in_item = identical(fit$est$beta, item$fit$est$beta),
+  nll = identical(cml$nll, item$fit$est$nll))
+```
+
+`algo_cml()` 的 `cml$betas` 是一題一個向量的 list，計分的 `algo_jme()` 直接吃它（[02_scoring](02_scoring.html)）。
+
+kits 不手推梯度和 Hessian。
+`nlminb()` 用 RTMB 的梯度走到最小值附近，再用 RTMB 的 Hessian 走幾步牛頓法（$\eta \leftarrow \eta - H^{-1}g$）。
+所以 kits 的 $\beta$ 比上面的手算更準。
+細節在 [模型教學](../tutorial_models/kits_models.html) 的第 2、3 節。
+
+### 教學程式
+
+`cml.R` 的 `cml` 段：`conv()`、`log_gamma()`、$\beta = \beta_0 + A\eta$、`nll()`、`fit_ad()`。
+
+```{r, code = script_part("cml.R", "cml"), eval = FALSE}
+```
+
+`"[<-" <- ADoverload("[<-")` 讓 RTMB 的值可以放進數值向量（RTMB 的寫法）。
+第 7 節一起跑。
+
+
+## 6 步驟參數的共變異數和 SE
+
+### 做什麼
+
+每個 $\beta$ 都是估計，有它的不確定性。
+$-\log L$ 在最小值的彎曲（Hessian）越大，估計越準。
+共變異數 $V$ 是 Hessian 的反矩陣，再用 $A$ 換回所有的 $\beta$。
+
+### 公式
+
+$$
+V(\hat\beta) = A H^{-1} A^\top, \qquad \mathrm{SE}(\hat\beta_{ig}) = \sqrt{V_{ig,ig}}
+$$
+
+```latex
+V(\hat\beta) = A H^{-1} A^\top, \qquad \mathrm{SE}(\hat\beta_{ig}) = \sqrt{V_{ig,ig}}
+```
+
+### 手算
+
+`optimHess()` 用數值微分給 Hessian：
+
+```{r}
+H <- optimHess(opt$par, nll_eta)
+V_hand <- A %*% solve(H) %*% t(A)
+se_hand <- sqrt(diag(V_hand))
+```
+
+數值微分在 $10^{-6}$ 以內：
+
+```{r}
+all.equal(se_hand, cf$beta_se, tolerance = 1e-6)
+```
+
+### 用 kits 算
+
+kits 的 Hessian 由 RTMB 自動微分，沒有數值誤差：
+
+```{r}
+c(V = identical(cml$vcov, fit$est$acov.beta),
+  se = identical(cml$coef$se, cf$beta_se))
+```
+
+最後一步的 $\beta$ 不是自由參數，它的 SE 也從 $A$ 來。
+$\sum\beta = 0$ 是固定的，所以 $V$ 的每一列加起來是 0。
+
+### 教學程式
+
+`cml` 段的最後三行：`obj$he(eta)` 是 RTMB 的 Hessian，`V <- A %*% solve(...) %*% t(A)`。
+
+
+## 7 門檻和它的 SE
+
+### 做什麼
+
+$\beta$ 不一定由小到大，不好解釋。
+門檻 $\mathit{thr}_{ik}$ 是「得 $k$ 分以上的機率剛好一半」的能力，同一題一定由小到大。
+所以報告用門檻。
+第 1 步的門檻就是「通過」。
+
+### 公式
+
+$$
+P(X_i \ge k \mid \theta = \mathit{thr}_{ik}) = RP \;(= 0.5), \qquad
+\mathrm{SE}(\mathit{thr}_{ik}) = \sqrt{J^\top V_i J},\quad
+J_g = \partial\,\mathit{thr}_{ik} / \partial\beta_{ig}
+$$
+
+```latex
+P(X_i \ge k \mid \theta = \mathit{thr}_{ik}) = RP \;(= 0.5), \qquad
+\mathrm{SE}(\mathit{thr}_{ik}) = \sqrt{J^\top V_i J},\quad
+J_g = \partial\,\mathit{thr}_{ik} / \partial\beta_{ig}
+```
+
+* $RP$：反應機率；預設 0.5（RP50）。連結都用 0.5。
+* $V_i$：題目 $i$ 的那一塊共變異數。
+* $J$：門檻對 $\beta$ 的偏微分；SE 照 delta method。
+
+### 手算：門檻
+
+`uniroot()` 找 $P(X \ge k) = 0.5$ 的 $\theta$，不需要導數：
+
+```{r}
+thr_of <- function(b, k, rp = 0.5) {
+  uniroot(\(t) sum(pcm(t, b)[-(1:k)]) - rp, c(-20, 20), tol = 1e-12)$root
+}
+thr02 <- c(thr_of(b02, 1), thr_of(b02, 2))
+all.equal(thr02, cf$thr[cf$item_id == "lan02"], tolerance = 1e-10)
+```
+
+### 手算：SE
+
+$J$ 用中央差分：$\beta$ 動一點點，看門檻動多少。
+
+```{r}
+thr_both <- function(b) c(thr_of(b, 1), thr_of(b, 2))
+J <- sapply(1:2, \(g) {
+  h <- 1e-5 * (1:2 == g)
+  (thr_both(b02 + h) - thr_both(b02 - h)) / 2e-5
+})
+idx <- which(cf$item_id == "lan02")
+se_thr <- sqrt(diag(J %*% cml$vcov[idx, idx] %*% t(J)))
+all.equal(se_thr, cf$thr_se[idx], tolerance = 1e-8)
+```
+
+### 用 kits 算
+
+`kits_thresholds()` 是校準的第 3 步；`algo_thresholds()` 是同一個計算：
+
+```{r}
+thr_kits <- kits_thresholds(fit)
+thr_algo <- algo_thresholds(cml)
+rbind(kits = same_cols(thr_kits, item$thresholds),
+      algo = same_cols(thr_algo, item$thresholds))
+```
+
+kits 的 $J$ 不用差分。
+一題的門檻是 $\sum_k \big(P(X_i \ge k \mid \theta_k) - RP\big)^2$ 的最小值；RTMB 的牛頓法把它變成「$\beta \to$ 門檻」的函數，它的 jacobian 就是 $J$。
+細節在 [模型教學](../tutorial_models/kits_models.html) 的第 5 節。
+
+別的反應機率：`coef(item, rp = )` 和 `algo_thresholds(cml, rp = )`。
+題目對照圖（item mapping）用得到，例如 RP80：
+
+```{r}
+thr80 <- algo_thresholds(cml, rp = 0.8)
+c(same = all(same_cols(thr80, coef(item, rp = 0.8))),
+  by_hand = isTRUE(all.equal(thr_of(b02, 1, 0.8), thr80$thr[idx[1]], tolerance = 1e-8)))
+```
+
+### 教學程式
+
+`cml.R` 的 `thr` 段：`p_ge()` 和 `uniroot()` 找門檻，`MakeTape(gap, ...)$newton()` 給 $J$。
+
+```{r, code = script_part("cml.R", "thr"), eval = FALSE}
+```
+
+`stats`、`cml`、`thr` 三段很便宜，直接在我們的 `X` 上跑（換掉 `inputs`）：
+
+```{r}
+env_own <- run_parts("cml.R", c("stats", "cml", "thr"), X = X)
+c(thr = all.equal(env_own$thresholds$thr, cf$thr, tolerance = 1e-6),
+  thr_se = all.equal(env_own$thresholds$thr_se, cf$thr_se, tolerance = 1e-6))
+```
+
+程式和 kits 走到同一個最大值，在最佳化的容許誤差（$10^{-6}$）以內相同。
+
+
+## 8 固定題
+
+### 做什麼
+
+新的一波想留在舊的量尺上時，把幾題固定在舊的 $\beta$。
+固定的步驟不估，直接用給的值；它們決定原點，所以 $\beta$ 的和不再是 0。
+固定步驟的 SE 是 0。
+
+### 公式
+
+$$
+\beta = \beta_0 + A\,\eta, \qquad
+\beta_{0,ig} = \begin{cases}\beta^{\text{fixed}}_{ig} & \text{fixed step}\\ 0 & \text{free step}\end{cases}
+$$
+
+```latex
+\beta = \beta_0 + A\,\eta, \qquad
+\beta_{0,ig} = \begin{cases}\beta^{\text{fixed}}_{ig} & \text{fixed step}\\ 0 & \text{free step}\end{cases}
+```
+
+$A$ 只有自由步驟的欄，所以固定步驟在 $V = AH^{-1}A^\top$ 裡是 0。
+
+### 手算
+
+把 lan01、lan05 固定在編出來的值（實際上是舊校準的 $\beta$）：
+
+```{r}
+fixed <- cf |>
+  filter(item_id %in% c("lan01", "lan05")) |>
+  transmute(item_id, item_score, beta = round(beta, 1) + 0.5)
+key <- paste(st$steps$item_id, st$steps$item_score)
+is_fixed <- key %in% paste(fixed$item_id, fixed$item_score)
+```
+
+$\beta_0$ 放固定的值；$A$ 拿掉固定步驟的欄：
+
+```{r}
+beta0 <- replace(numeric(S), is_fixed, fixed$beta)
+A_fix <- diag(S)[, !is_fixed]
+nll_fix <- function(eta) nll_beta(beta0 + drop(A_fix %*% eta))
+opt_fix <- nlminb(numeric(ncol(A_fix)), nll_fix, control = ctrl)
+beta_fix <- beta0 + drop(A_fix %*% opt_fix$par)
+```
+
+### 用 kits 算
+
+`kits_item(X, fixed_params = )`；兩層的管線都把 `fixed_params` 給 `kits_stats()`：
+
+```{r}
+item_fix <- kits_item(X, fixed_params = fixed, scale = "lan sim")
+thr_fix <- kits_stats(X, fixed_params = fixed) |>
+  algo_cml() |>
+  algo_thresholds()
+all(same_cols(thr_fix, item_fix$thresholds))
+```
+
+和手算比（數值梯度，$10^{-6}$ 以內），再看原點和 SE：
+
+```{r}
+cf_fix <- coef(item_fix)
+c(by_hand = isTRUE(all.equal(beta_fix, cf_fix$beta, tolerance = 1e-6)),
+  fixed_kept = identical(cf_fix$beta[is_fixed], fixed$beta),
+  se_zero = all(cf_fix$beta_se[is_fixed] == 0))
+sum(cf_fix$beta)
+```
+
+### 不放進校準的固定題
+
+CML 要每一題有 0 分、至少兩種分數。
+不然 $n_{i1}$ 是答這題的所有人，$\beta_{i1}$ 跑到 $-\infty$。
+後來的波次常有大家都通過的簡單題。
+它是固定題時，不放進計數，保留固定的 $\beta$，SE 是 0（`left_out`）。
+
+lan00 是編出來的固定題，每個孩子都拿滿分。
+它從 `fixed` 改出來，所以和 `fixed` 一樣記著量尺 `lan sim`：
+
+```{r}
+easy <- fixed |>
+  slice(1:2) |>
+  mutate(item_id = "lan00", item_score = 1:2, beta = c(-7, -6))
+X_easy <- cbind(lan00 = 2, X)
+item_easy <- kits_item(X_easy, fixed_params = bind_rows(easy, fixed), scale = "lan sim")
+item_easy$left_out
+```
+
+它的門檻照第 7 節從固定的 $\beta$ 算，SE 是 0；其他題和上面相同：
+
+```{r}
+cf_easy <- coef(item_easy)
+c(thr = isTRUE(all.equal(thr_of(easy$beta, 1), cf_easy$thr[1], tolerance = 1e-8)),
+  se = cf_easy$thr_se[1] == 0,
+  others = identical(cf_easy$beta[-(1:2)], cf_fix$beta))
+```
+
+不是固定題時，函數停下來：固定它，或從資料拿掉它。
+
+### 教學程式
+
+`cml.R` 在 `compare` 段之後有兩段：`fixed` 和 `fixed_out`。
+
+```{r, code = script_part("cml.R", "fixed"), eval = FALSE}
+```
+
+這兩段用示範資料的題號（例如 `lana01`），所以在示範資料上跑整份程式。
+它每一段自己和 kits 比，差距在 `diffs`、`diffs_fixed`、`diffs_easy`：
+
+```{r}
+parts_cml <- c("inputs", "stats", "cml", "thr", "compare", "fixed", "fixed_out")
+env_cml <- run_parts("cml.R", parts_cml)
+map(list(cml = env_cml$diffs, fixed = env_cml$diffs_fixed, fixed_out = env_cml$diffs_easy),
+    \(d) all(d < 1e-6))
+```
+
+
+## 9 可重現的管線
+
+### 做什麼
+
+下面這一段只要 `library(kits)`。
+貼到一個全新的 R，就重做這份教學的資料和校準，數字完全相同。
+它也印出兩條管線和 `kits_item()` 一欄一欄 `identical()`。
+
+```{r pipe-cml, eval = FALSE}
+library(kits)
+set.seed(7)
+b <- seq(-2.5, 2, length.out = 8)
+betas <- lapply(b, \(x) x + c(-0.5, 0.5))
+betas[c(1, 4)] <- b[c(1, 4)]
+names(betas) <- sprintf("lan%02d", 1:8)
+wave_m <- rep(c(6, 12, 24), each = 200)
+age_m <- wave_m + runif(600, -1, 1)
+theta <- 1.8 * log(age_m / 12) + rnorm(600, 0, 0.9)
+X <- kits_sim(theta, betas)
+X[wave_m == 6, c("lan07", "lan08")] <- NA
+X[wave_m == 24, c("lan01", "lan02")] <- NA
+X[which(wave_m == 12)[1:10], "lan08"] <- NA
+
+item <- kits_item(X, scale = "lan sim")
+thr_kits <- X |> kits_stats() |> kits_cml() |> kits_thresholds()
+thr_algo <- kits_stats(X) |> algo_cml() |> algo_thresholds()
+same <- \(a, b) sapply(names(a), \(v) identical(a[[v]], b[[v]]))
+rbind(kits = same(thr_kits, item$thresholds), algo = same(thr_algo, item$thresholds))
+print(item$thresholds$thr[1:3], digits = 15)
+```
+
+### 在全新的 R 裡跑
+
+`run_fresh()` 用 callr 開一個新的 R，只載入 kits，跑上面那一段：
+
+```{r}
+run_fresh <- function(label) {
+  code <- knitr::knit_code$get(label)
+  run <- \(code) utils::capture.output(source(textConnection(code), print.eval = TRUE))
+  cat(callr::r(run, list(code)), sep = "\n")
+}
+run_fresh("pipe-cml")
+```
+
+最後一行和這份教學算的門檻，到第 15 位都相同：
+
+```{r}
+print(item$thresholds$thr[1:3], digits = 15)
+```
+
+三條路是同一段程式：`kits_item()` 裡面就是那三步，而 `kits_cml()`、`kits_thresholds()` 把計算交給 `algo_cml()`、`algo_thresholds()`。
+`kits_` 一層另外管輸入的檢查、量尺的標籤、診斷和印出。
+
+
+## 10 下一步
+
+* 有了題目參數，下一步是給每個孩子一個分數：[02_scoring](02_scoring.html)。
+* 兩個校準接到同一條量尺：[03_linking](03_linking.html)。
+* 題目適配、DIF 和其他檢查：[05_checks](05_checks.html)。
+* 模型在 RTMB 裡怎麼寫：[kits 的模型](../tutorial_models/kits_models.html)。
+
+```{r}
+round(difftime(Sys.time(), t_start, units = "secs"))
+```
+
+
+## 參考文獻
+
+Adams, R. J., Wu, M. L., & Wilson, M. (2012). The Rasch rating model and the disordered threshold
+controversy. *Educational and Psychological Measurement, 72*(4), 547–573.
+https://doi.org/10.1177/0013164411432166
+
+Kristensen, K. (2026). *RTMB: R bindings for TMB* (R package version 2.0).
+https://doi.org/10.32614/CRAN.package.RTMB
+
+Kristensen, K., Nielsen, A., Berg, C. W., Skaug, H., & Bell, B. M. (2016). TMB: Automatic
+differentiation and Laplace approximation. *Journal of Statistical Software, 70*(5), 1–21.
+https://doi.org/10.18637/jss.v070.i05
+
+Maris, G., Bechger, T., Koops, J., & Partchev, I. (2026). *dexter: Data management and analysis of
+tests* (R package version 1.8.1). https://dexter-psychometrics.github.io/dexter/
+
+Masters, G. N. (1982). A Rasch model for partial credit scoring. *Psychometrika, 47*(2), 149–174.
+https://doi.org/10.1007/BF02296272
+
+R Core Team (2026). *R: A language and environment for statistical computing*. R Foundation for
+Statistical Computing, Vienna, Austria. https://www.R-project.org/

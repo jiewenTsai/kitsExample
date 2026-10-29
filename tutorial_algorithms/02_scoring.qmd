@@ -1,0 +1,766 @@
+---
+title: "計分：每個孩子的 WLE"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    embed-resources: true
+    grid:
+      body-width: 1100px
+from: markdown+east_asian_line_breaks
+---
+
+```{=html}
+<style>
+.MathJax_Display, mjx-container { overflow-x: auto; overflow-y: hidden; }
+</style>
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+options(width = 100)
+t_start <- Sys.time()
+```
+
+## 0 這份教學
+
+### 你會學到什麼
+
+校準（[01_calibration](01_calibration.html)）給了每一題的步驟參數 $\beta$。
+這份教學用這些 $\beta$，給每個孩子一個能力分數 $\hat\theta$ 和它的 SE。
+kits 的分數叫 WLE（weighted likelihood estimate）。
+
+1. 一個孩子的概似：原始分就夠了（第 2 節）。
+2. 測驗訊息 $I(\theta)$（第 3 節）。
+3. WLE：概似加上 $\tfrac12\log I$ 的最大值（第 4 節）。
+4. Warm 原來的算法：解一個分數方程，得到同一個 $\theta$（第 5 節，只是比較）。
+5. SE（第 6 節）。
+6. 原始分換算表（第 7 節）。
+7. 個人適配：infit 和 outfit（第 8 節）。
+8. 貼到新的 R 就能重做的管線（第 10 節）。
+
+每一節都照同樣的順序：
+
+* 這一步做什麼（白話）。
+* 公式：排好的數學式，和一模一樣的 LaTeX（右上角的按鈕一鍵複製）。
+* 手算：在模擬資料上，用 base R 照公式自己算一次。
+* 用 kits 算：`kits_` 一層和 `algo_` 一層各算一次，和手算比。
+* 教學程式：`wle.R` 是哪一段；便宜的就直接跑。
+
+### 你需要什麼
+
+* 讀過 [01_calibration](01_calibration.html) 的第 3 節（PCM）。
+* R 和 kits；整理資料用 dplyr、tidyr、purrr、tibble，畫圖用 ggplot2。
+
+WLE 在 RTMB 裡怎麼寫，在 [kits 的模型](../tutorial_models/kits_models.html) 的第 4 節。
+這份教學需要時指過去，不重複。
+
+```{r, message = FALSE}
+library(kits)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+```
+
+### 這個算法的總覽
+
+```{r}
+kits_algorithm("wle")
+```
+
+第 1–4 步是這份教學的第 2–6 節，第 5 步是第 8 節。
+第 6 步（換算到別的量尺）在 [03_linking](03_linking.html)。
+`Components` 的第二行是簡寫：`algo_jme()` 吃的是 `cml$betas`、每個人次的原始分和答過的題（第 4 節）。
+
+### 三個小工具
+
+和 01_calibration 相同：`script_part()` 讀出教學程式的一段，`run_parts()` 在新的環境裡跑幾段，`same_cols()` 一欄一欄 `identical()`。
+
+```{r}
+script_part <- function(file, part) {
+  code <- readLines(system.file("scripts", file, package = "kits"))
+  marks <- grep("^# ==== ", code)
+  start <- grep(sprintf("^# ==== (part: )?%s ====", part), code)
+  end <- c(marks[marks > start], length(code) + 1)[1] - 1
+  code[start:end]
+}
+```
+
+```{r}
+run_parts <- function(file, parts, ...) {
+  code <- readLines(system.file("scripts", file, package = "kits"))
+  top <- code[seq_len(grep("^# ==== inputs ====", code) - 1)]
+  env <- list2env(list(...), envir = new.env(parent = globalenv()))
+  body <- unlist(map(parts, \(p) script_part(file, p)))
+  printed <- capture.output(suppressMessages(eval(parse(text = c(top, body)), envir = env)))
+  env
+}
+```
+
+```{r}
+same_cols <- function(a, b, cols = names(a)) {
+  map_lgl(set_names(cols), \(v) identical(a[[v]], b[[v]]))
+}
+```
+
+
+## 1 資料和校準
+
+和 01_calibration 同一份模擬資料：8 題，三個波次，四個作答組合。
+
+```{r data}
+set.seed(7)
+b <- seq(-2.5, 2, length.out = 8)
+betas <- lapply(b, \(x) x + c(-0.5, 0.5))
+betas[c(1, 4)] <- b[c(1, 4)]
+names(betas) <- sprintf("lan%02d", 1:8)
+```
+
+```{r data-x}
+wave_m <- rep(c(6, 12, 24), each = 200)
+age_m <- wave_m + runif(600, -1, 1)
+theta <- 1.8 * log(age_m / 12) + rnorm(600, 0, 0.9)
+X <- kits_sim(theta, betas)
+```
+
+```{r data-na}
+X[wave_m == 6, c("lan07", "lan08")] <- NA
+X[wave_m == 24, c("lan01", "lan02")] <- NA
+X[which(wave_m == 12)[1:10], "lan08"] <- NA
+```
+
+校準，再計分。
+`persons` 給每個人次的波次和月齡（換算表要用）：
+
+```{r}
+item <- kits_item(X, scale = "lan sim")
+cml <- algo_cml(item$stats)
+persons <- tibble(visit_id = rownames(X), wave_m, age_m)
+s <- kits_subj(X, item, persons = persons)
+```
+
+分數表一列一個人次（這裡不印編號）：
+
+```{r}
+as_tibble(s) |>
+  select(-visit_id) |>
+  head(4)
+```
+
+* `raw`：原始分；`raw_max`：答過的題目的滿分加起來。
+* `theta`、`se`：WLE 和它的 SE。
+* `infit`、`outfit`、`flag`：個人適配（第 8 節）。
+
+`cml$betas` 是一題一個向量的步驟參數，`algo_` 一層的計分都吃它：
+
+```{r}
+str(cml$betas[1:2])
+```
+
+
+## 2 一個孩子的概似
+
+### 做什麼
+
+概似 $L_p(\theta)$ 是「這個孩子剛好這樣作答」的機率，當成 $\theta$ 的函數。
+它是答過的每一題的 PCM 機率相乘。
+在 PCM 裡，它只透過原始分 $r_p$ 和 $\theta$ 有關。
+所以同一組題目、同樣的原始分，分數一定相同。
+
+### 公式
+
+$$
+\log L_p(\theta) = r_p\,\theta - \sum_i \log S_i(\theta) + c, \qquad
+S_i(\theta) = \sum_{k=0}^{m_i} \exp\Big(k\theta - \sum_{g=1}^{k}\beta_{ig}\Big)
+$$
+
+```latex
+\log L_p(\theta) = r_p\,\theta - \sum_i \log S_i(\theta) + c, \qquad
+S_i(\theta) = \sum_{k=0}^{m_i} \exp\Big(k\theta - \sum_{g=1}^{k}\beta_{ig}\Big)
+```
+
+* $i$：孩子 $p$ 答過的題目。
+* $S_i$：題目 $i$ 的 PCM 分母。
+* $c = -\sum_i \sum_{g \le x_{pi}} \beta_{ig}$：和 $\theta$ 無關的常數。
+
+### 手算
+
+PCM 的類別機率（01_calibration 第 3 節）：
+
+```{r}
+pcm <- function(theta, beta) {
+  eta <- c(0, cumsum(theta - beta))
+  exp(eta) / sum(exp(eta))
+}
+```
+
+第一個 `ok` 的孩子，和他答過的題目：
+
+```{r}
+p1 <- which(s$flag == "ok")[1]
+x <- X[p1, !is.na(X[p1, ])]
+x
+```
+
+$\log L$ 照定義（機率相乘），和照公式（只用原始分）：
+
+```{r}
+log_lik <- function(t) sum(log(map2_dbl(names(x), x, \(i, k) pcm(t, cml$betas[[i]])[k + 1])))
+c_p <- -sum(map2_dbl(names(x), x, \(i, k) sum(cml$betas[[i]][seq_len(k)])))
+log_S <- function(t) map_dbl(cml$betas[names(x)], \(b) algo_pcm(t, b)$log_S)
+log_lik_r <- function(t) sum(x) * t - sum(log_S(t)) + c_p
+```
+
+兩個寫法在每個 $\theta$ 都相同：
+
+```{r}
+th <- c(-2, 0, 1.5)
+all.equal(map_dbl(th, log_lik), map_dbl(th, log_lik_r), tolerance = 1e-12)
+```
+
+`algo_pcm()` 的 `log_S` 就是 $\log S_i(\theta)$。
+
+### 原始分就夠了
+
+分數表裡，不重複的「作答組合 × 原始分」比人次少很多：
+
+```{r}
+as_tibble(s) |>
+  summarise(n_theta = n_distinct(theta), .by = c(pattern_id, raw)) |>
+  summarise(combos = n(), max_theta_per_combo = max(n_theta))
+```
+
+一個組合只有一個 $\theta$。
+所以 kits 一個組合只估一次，再接回每個人次。
+
+
+## 3 測驗訊息
+
+### 做什麼
+
+訊息 $I(\theta)$ 說這組題目在 $\theta$ 附近量得多準。
+PCM 的訊息就是每題分數的變異數加起來。
+它的倒數開根號，大約是 $\hat\theta$ 的 SE。
+
+### 公式
+
+$$
+I_p(\theta) = \sum_i \mathrm{Var}(X_i \mid \theta) = \sum_i \sum_k (k - E_i)^2 P_{ik},
+\qquad E_i = \sum_k k\,P_{ik}
+$$
+
+```latex
+I_p(\theta) = \sum_i \mathrm{Var}(X_i \mid \theta) = \sum_i \sum_k (k - E_i)^2 P_{ik},
+\qquad E_i = \sum_k k\,P_{ik}
+```
+
+### 手算
+
+一題的變異數，再加起來：
+
+```{r}
+item_var <- function(t, b) {
+  P <- pcm(t, b)
+  k <- seq_along(P) - 1
+  sum((k - sum(k * P))^2 * P)
+}
+info_hand <- function(t) sum(map_dbl(cml$betas[names(x)], \(b) item_var(t, b)))
+```
+
+### 用 kits 算
+
+`kits_information()` 給一組題目的 $I(\theta)$；`algo_pcm()` 的 `Var` 是每題的變異數：
+
+```{r}
+info_kits <- kits_information(item, items = names(x))
+info_algo <- function(t) sum(map_dbl(cml$betas[names(x)], \(b) algo_pcm(t, b)$Var))
+c(kits = all.equal(map_dbl(th, info_hand), info_kits(th), tolerance = 1e-12),
+  algo = all.equal(map_dbl(th, info_hand), map_dbl(th, info_algo), tolerance = 1e-12))
+```
+
+`kits_pcm_prob(item, theta)` 也印得出每題的變異數和訊息的斜率 $I'(\theta)$（01_calibration 第 3 節）。
+
+
+## 4 WLE：Jeffreys 眾數
+
+### 做什麼
+
+直接最大化 $\log L$ 是最大概似估計（MLE）。
+題目少時，MLE 往兩端偏；0 分和滿分的孩子，MLE 是 $\pm\infty$。
+Warm（1989）加上 $\tfrac12\log I(\theta)$，偏誤變小，而且每個孩子都有有限的分數。
+這就是 WLE。
+
+$\tfrac12\log I$ 剛好是 Jeffreys 先驗 $\sqrt{I(\theta)}$ 取對數。
+所以這個最大值也是 Jeffreys 先驗的後驗眾數（Firth, 1993）。
+對 PCM，Warm 的 WLE 和 Jeffreys 眾數完全相同（Magis, 2015）。
+kits 就直接最大化 $\log L + \tfrac12\log I$，用 RTMB 的牛頓法（`algo_jme()`）。
+
+### 公式
+
+$$
+\hat\theta_p = \arg\max_\theta \Big[\log L_p(\theta) + \tfrac12 \log I_p(\theta)\Big]
+$$
+
+```latex
+\hat\theta_p = \arg\max_\theta \Big[\log L_p(\theta) + \tfrac12 \log I_p(\theta)\Big]
+```
+
+### 手算
+
+第 2 節的孩子：要最大化的 $f$，用 `optimize()` 找最大值（不需要導數）：
+
+```{r}
+f <- function(t) log_lik(t) + 0.5 * log(info_hand(t))
+theta_hand <- optimize(f, c(-10, 10), maximum = TRUE, tol = 1e-10)$maximum
+c(by_hand = theta_hand, kits = s$theta[p1])
+```
+
+`optimize()` 只到大約 $10^{-8}$，所以在 $10^{-6}$ 以內比：
+
+```{r}
+all.equal(theta_hand, s$theta[p1], tolerance = 1e-6)
+```
+
+$f$ 是兩條曲線加起來：$\log L$（灰）和 $\tfrac12\log I$（橘）。
+WLE（藍的最高點）比 MLE（灰的最高點）靠近中間一點。
+
+```{r}
+curves <- tibble(theta = seq(-4, 3, by = 0.05)) |>
+  mutate(`log L` = map_dbl(theta, log_lik),
+         `1/2 log I` = 0.5 * log(map_dbl(theta, info_hand)),
+         f = `log L` + `1/2 log I`) |>
+  pivot_longer(-theta, names_to = "curve")
+```
+
+```{r, fig.width = 7, fig.height = 3.5}
+colours <- c(`log L` = "#7F7F7F", `1/2 log I` = "#D55E00", f = "#0072B2")
+ggplot(curves, aes(theta, value, colour = curve)) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = s$theta[p1], colour = "#0072B2", linetype = "dashed") +
+  scale_colour_manual(values = colours) +
+  labs(x = expression(theta), y = NULL, colour = NULL) +
+  theme_minimal()
+```
+
+### 用 kits 算
+
+`kits_subj()` 的 `theta` 和 `se`，和 `algo_jme()` 一個人次一列算的完全相同：
+
+```{r}
+raw <- rowSums(X, na.rm = TRUE)
+sets <- apply(!is.na(X), 1, \(z) colnames(X)[z], simplify = FALSE)
+jme <- algo_jme(cml$betas, raw = raw, items = sets)
+c(theta = identical(jme$theta, s$theta), se = identical(jme$se, s$se))
+```
+
+* 起始值和 TAM 相同：這組題的 $\beta$ 的平均，加上 $\log\frac{r + 0.5}{\text{滿分} - r + 1}$。
+* 所有組合的 $-f$ 加起來錄成一個 RTMB tape，`$newton()` 一次解出全部。
+* $f$ 有兩個高點時（題目很少、難度差很遠），kits 取 $f$ 比較高的那一個（目標函數值決定）；一樣高時取 $\theta$ 小的那個。
+
+0 分和滿分的孩子也有有限的 WLE：
+
+```{r}
+as_tibble(s) |>
+  filter(flag %in% c("zero", "perfect")) |>
+  distinct(pattern_id, raw, theta, se, flag)
+```
+
+### 寫在方法裡的一句話
+
+> We estimated person ability with the weighted likelihood estimator (WLE; Warm, 1989). For the
+> partial credit model, the WLE equals the mode of the likelihood penalized by the Jeffreys prior
+> (Firth, 1993; Magis, 2015). We therefore computed it by maximizing ℓ(θ) + ½ log I(θ) in RTMB.
+
+### 教學程式
+
+`wle.R` 的 `wle` 段：`item_terms()` 給 $\log S_i$ 和 $\mathrm{Var}_i$，`neg_f()` 是 $-f$，`MakeTape(neg_f, ...)$newton()` 解出 $\theta$。
+
+```{r, code = script_part("wle.R", "wle"), eval = FALSE}
+```
+
+這一段很便宜，直接在我們的 `X` 上跑（換掉 `inputs`：放進 `X` 和題目參數 `cf`）。
+`person_fit`（第 8 節）和 `warm`（第 5 節）兩段一起跑：
+
+```{r}
+cf <- select(coef(item), item_id, item_score, beta)
+env <- run_parts("wle.R", c("wle", "person_fit", "warm"), X = X, cf = cf)
+by_id <- match(s$visit_id, env$subj$visit_id)
+c(theta = all.equal(env$subj$theta[by_id], s$theta, tolerance = 1e-6),
+  se = all.equal(env$subj$se[by_id], s$se, tolerance = 1e-6))
+```
+
+程式和 kits 在最佳化的容許誤差（$10^{-6}$）以內相同。
+
+
+## 5 Warm 原來的算法（只是比較）
+
+### 做什麼
+
+Warm（1989）不是直接最大化 $f$。
+他把 MLE 的分數方程（$d\log L/d\theta = 0$）加上一個修正項，再解這個方程。
+這一節說明：對 PCM，這個根就是第 4 節的最大值。
+它只是比較，不是任何函數的選項。
+
+### 公式
+
+$$
+\frac{d\log L(\theta)}{d\theta} + \frac{J(\theta)}{2I(\theta)} = 0, \qquad
+I = \sum_{i,k} \frac{P_{ik}'^2}{P_{ik}}, \qquad
+J = \sum_{i,k} \frac{P_{ik}'\,P_{ik}''}{P_{ik}}
+$$
+
+```latex
+\frac{d\log L(\theta)}{d\theta} + \frac{J(\theta)}{2I(\theta)} = 0, \qquad
+I = \sum_{i,k} \frac{P_{ik}'^2}{P_{ik}}, \qquad
+J = \sum_{i,k} \frac{P_{ik}'\,P_{ik}''}{P_{ik}}
+```
+
+在 PCM 裡，$P_{ik}' = P_{ik}(k - E_i)$，所以：
+
+* $d\log L/d\theta = r - \sum_i E_i$。
+* $I = \sum_i \mathrm{Var}_i$，就是第 3 節的訊息。
+* $J = \sum_i \sum_k (k - E_i)^3 P_{ik}$，三階中央動差的和，剛好等於 $I'(\theta)$。
+
+所以 Warm 的方程就是 $\frac{d}{d\theta}\big[\log L + \tfrac12\log I\big] = 0$：同一個 $\theta$。
+
+### 手算
+
+`algo_pcm(third = TRUE)` 給每題的 $E$、$\mathrm{Var}$ 和三階中央動差 `M3`：
+
+```{r}
+warm_eq <- function(t) {
+  m <- map(cml$betas[names(x)], \(b) algo_pcm(t, b, third = TRUE))
+  sum(x) - sum(map_dbl(m, "E")) + sum(map_dbl(m, "M3")) / (2 * sum(map_dbl(m, "Var")))
+}
+theta_warm <- uniroot(warm_eq, c(-10, 10), tol = 1e-12)$root
+all.equal(theta_warm, s$theta[p1], tolerance = 1e-8)
+```
+
+### 教學程式
+
+`wle.R` 的 `warm` 段：$P'$、$P''$ 和 $d\log S_i/d\theta$ 由 RTMB 的 tape 給（`jacfun()`），`uniroot()` 解方程。
+
+```{r, code = script_part("wle.R", "warm"), eval = FALSE}
+```
+
+第 4 節已經在我們的 `X` 上跑過。
+每個組合，Warm 的根和 `algo_jme()` 在 $10^{-8}$ 以內相同：
+
+```{r}
+c(vs_script_wle = max(abs(env$warm - env$combos$theta)) < 1e-8,
+  vs_algo_jme = max(abs(env$warm - env$jme$theta)) < 1e-8)
+```
+
+
+## 6 SE
+
+### 做什麼
+
+$\hat\theta$ 的 SE 用測驗訊息：訊息越大，量得越準。
+WLE 和 MLE 的漸近變異數相同（Warm, 1989），都是 $1/I(\hat\theta)$。
+$I$ 就是第 3 節的訊息，解 $\hat\theta$ 時同一段程式已經算好，不必另外微分。
+
+### 公式
+
+$$
+\mathrm{SE}(\hat\theta) = \frac{1}{\sqrt{I(\hat\theta)}}
+$$
+
+```latex
+\mathrm{SE}(\hat\theta) = \frac{1}{\sqrt{I(\hat\theta)}}
+```
+
+### 手算
+
+```{r}
+se_hand <- 1 / sqrt(info_hand(s$theta[p1]))
+all.equal(se_hand, s$se[p1], tolerance = 1e-12)
+```
+
+0 分和滿分的孩子也有 SE；這些孩子的訊息小，SE 比較大。
+kits 0.24.1 以前用 Warm 的式子 $\sqrt{I + (I'/2I)^2}\,/\,I$，比 $1/\sqrt{I}$ 稍大，0 分和滿分差最多。
+
+
+## 7 原始分換算表
+
+### 做什麼
+
+原始分是充分統計量，所以一個作答組合、一個原始分，就有一個 $\theta$。
+換算表讓人不用電腦也能從原始分查到 $\theta$。
+每個波次用它的標準題本：最多孩子答的作答組合。
+
+### 公式
+
+$$
+F_w = \arg\max_F n_w(F), \qquad
+\hat\theta(r) = \arg\max_\theta \Big[r\theta - \sum_{i\in F_w}\log S_i(\theta)
+  + \tfrac12\log I_{F_w}(\theta)\Big]
+$$
+
+$$
+\mathit{pct}_r = 100\, n_r \Big/ \sum_r n_r, \qquad
+\mathit{form\_pct} = 100 \sum_r n_r \big/ n_w
+$$
+
+```latex
+F_w = \arg\max_F n_w(F), \qquad
+\hat\theta(r) = \arg\max_\theta \Big[r\theta - \sum_{i\in F_w}\log S_i(\theta)
+  + \tfrac12\log I_{F_w}(\theta)\Big]
+
+\mathit{pct}_r = 100\, n_r \Big/ \sum_r n_r, \qquad
+\mathit{form\_pct} = 100 \sum_r n_r \big/ n_w
+```
+
+* $F_w$：波次 $w$ 的標準題本；$n_w(F)$ 是答作答組合 $F$ 的孩子數。
+* $n_r$：這個波次在標準題本上得 $r$ 分的孩子數；$n_w$ 是這個波次所有的孩子。
+
+### 用 kits 算
+
+分數表帶著波次，所以直接做換算表：
+
+```{r}
+tab <- kits_subj_table(s)
+filter(tab, wave_m == 6)
+```
+
+12 個月有 10 個孩子漏答第 8 題，不在表裡；每個波次的所有作答組合在 `attr(, "forms")`：
+
+```{r}
+attr(tab, "forms") |>
+  select(wave_m, form, type, n)
+```
+
+### 手算
+
+6 個月的標準題本是 lan01–lan06。
+它的 $\theta$ 就是這 6 題、原始分 0 到 10 的 WLE：
+
+```{r}
+form6 <- sprintf("lan%02d", 1:6)
+jme6 <- algo_jme(cml$betas[form6])
+t6 <- as_tibble(tab) |>
+  filter(wave_m == 6)
+c(theta = identical(jme6$theta, t6$theta), se = identical(jme6$se, t6$se))
+```
+
+人數和百分比：
+
+```{r}
+n_r <- tabulate(raw[wave_m == 6] + 1, nbins = 11)
+c(n = identical(n_r, t6$n), pct = isTRUE(all.equal(100 * n_r / sum(n_r), t6$pct)))
+```
+
+### 不用資料的表
+
+`kits_subj_table(item)` 給校準的每個作答組合、每個原始分（0 到滿分）的 WLE。
+它給現場查分數用：
+
+```{r}
+lookup <- kits_subj_table(item)
+count(as_tibble(lookup), pattern_id)
+```
+
+這個表一次解所有的作答組合，牛頓法停下來的地方差在 $10^{-12}$ 以內：
+
+```{r}
+bk1 <- filter(as_tibble(lookup), pattern_id == "bk1")
+all.equal(bk1$theta, jme6$theta, tolerance = 1e-12)
+```
+
+### 教學程式
+
+換算表沒有自己的程式：它的 $\theta$ 就是 `wle.R` 的 `wle` 段（第 4 節）。
+
+
+## 8 個人適配
+
+### 做什麼
+
+一個孩子的作答，和模型在他的 $\hat\theta$ 說的一致嗎？
+殘差 $x - E$ 是實際分數減期望分數。
+infit 是殘差平方和除以變異數和（用訊息量加權）；outfit 是每個標準化殘差平方的平均（不加權）。
+模型成立時兩者約是 1。
+這是在 $\hat\theta$ 的殘差（Wright & Masters, 1982）。
+
+### 公式
+
+$$
+E_{pi} = \sum_k k\,P_{ik}(\hat\theta_p), \qquad
+W_{pi} = \sum_k k^2 P_{ik}(\hat\theta_p) - E_{pi}^2
+$$
+
+$$
+\text{infit}_p = \frac{\sum_i (x_{pi} - E_{pi})^2}{\sum_i W_{pi}}, \qquad
+\text{outfit}_p = \frac{1}{n_p}\sum_i \frac{(x_{pi} - E_{pi})^2}{W_{pi}}, \qquad
+\text{misfit} \iff \max(\text{infit}, \text{outfit}) > 2
+$$
+
+```latex
+E_{pi} = \sum_k k\,P_{ik}(\hat\theta_p), \qquad
+W_{pi} = \sum_k k^2 P_{ik}(\hat\theta_p) - E_{pi}^2
+
+\text{infit}_p = \frac{\sum_i (x_{pi} - E_{pi})^2}{\sum_i W_{pi}}, \qquad
+\text{outfit}_p = \frac{1}{n_p}\sum_i \frac{(x_{pi} - E_{pi})^2}{W_{pi}}, \qquad
+\text{misfit} \iff \max(\text{infit}, \text{outfit}) > 2
+```
+
+* $n_p$：孩子 $p$ 答過的題數。
+* 0 分和滿分的孩子，殘差沒有資訊，所以不算（`NA`）。
+* 大於 2 表示作答很不規則，會扭曲測量（Linacre, 2002）；`flag` 標 `misfit`。
+* 題少時，即使模型成立也常遠低於 1，所以只比答同一題本的孩子。
+
+### 手算
+
+第 2 節的孩子，在他的 $\hat\theta$：
+
+```{r}
+P <- map(cml$betas[names(x)], \(b) pcm(s$theta[p1], b))
+E <- map_dbl(P, \(p) sum((seq_along(p) - 1) * p))
+W <- map_dbl(P, \(p) sum((seq_along(p) - 1)^2 * p)) - E^2
+fit_hand <- c(infit = sum((x - E)^2) / sum(W), outfit = mean((x - E)^2 / W))
+```
+
+```{r}
+all.equal(fit_hand, c(infit = s$infit[p1], outfit = s$outfit[p1]), tolerance = 1e-12)
+```
+
+### 用 kits 算
+
+`algo_pcm()` 在 $\hat\theta$ 給同樣的 $E$ 和 $W$；用它算，和 `kits_subj()` 一模一樣：
+
+```{r}
+m <- map(cml$betas[names(x)], \(b) algo_pcm(s$theta[p1], b))
+E_a <- map_dbl(m, "E")
+W_a <- map_dbl(m, "Var")
+c(infit = identical(sum((x - E_a)^2) / sum(W_a), s$infit[p1]),
+  outfit = identical(mean((x - E_a)^2 / W_a), s$outfit[p1]))
+```
+
+每一種 `flag` 有幾個人次：
+
+```{r}
+count(as_tibble(s), flag)
+```
+
+### 教學程式
+
+`wle.R` 的 `person_fit` 段：`moments()` 給每個作答的 $E$、$W$，再照公式算 infit、outfit 和 `flag`。
+
+```{r, code = script_part("wle.R", "person_fit"), eval = FALSE}
+```
+
+第 4 節已經在我們的 `X` 上跑過：
+
+```{r}
+fit_script <- env$subj[by_id, ]
+c(infit = all.equal(fit_script$infit, s$infit, tolerance = 1e-6),
+  outfit = all.equal(fit_script$outfit, s$outfit, tolerance = 1e-6),
+  flag = identical(fit_script$flag, s$flag))
+```
+
+
+## 9 換算到別的量尺
+
+`kits_subj()` 的 $\theta$ 在校準的量尺上（`attr(s, "scale")`）。
+換到另一條量尺（另一個世代，或接到 D）用 `kits_convert(s, link)`：每一條連結 $\theta^* = B + A\theta$，SE 乘上 $A$。
+連結和換算在 [03_linking](03_linking.html)；教學程式是 `wle.R` 的 `convert` 段。
+
+
+## 10 可重現的管線
+
+### 做什麼
+
+下面這一段只要 `library(kits)`。
+貼到一個全新的 R，就重做這份教學的資料、校準和分數，數字完全相同。
+它印出 `algo_` 一層和 `kits_subj()`、`kits_subj_table()` 的 `identical()`。
+
+```{r pipe-wle, eval = FALSE}
+library(kits)
+set.seed(7)
+b <- seq(-2.5, 2, length.out = 8)
+betas <- lapply(b, \(x) x + c(-0.5, 0.5))
+betas[c(1, 4)] <- b[c(1, 4)]
+names(betas) <- sprintf("lan%02d", 1:8)
+wave_m <- rep(c(6, 12, 24), each = 200)
+age_m <- wave_m + runif(600, -1, 1)
+theta <- 1.8 * log(age_m / 12) + rnorm(600, 0, 0.9)
+X <- kits_sim(theta, betas)
+X[wave_m == 6, c("lan07", "lan08")] <- NA
+X[wave_m == 24, c("lan01", "lan02")] <- NA
+X[which(wave_m == 12)[1:10], "lan08"] <- NA
+
+item <- kits_item(X, scale = "lan sim")
+s <- kits_subj(X, item, persons = data.frame(visit_id = rownames(X), wave_m))
+cml <- kits_stats(X) |> algo_cml()
+sets <- apply(!is.na(X), 1, \(z) colnames(X)[z], simplify = FALSE)
+jme <- algo_jme(cml$betas, raw = rowSums(X, na.rm = TRUE), items = sets)
+c(theta = identical(jme$theta, s$theta), se = identical(jme$se, s$se))
+t6 <- subset(kits_subj_table(s), wave_m == 6)
+identical(algo_jme(cml$betas[1:6])$theta, t6$theta)
+print(s$theta[1:3], digits = 15)
+```
+
+### 在全新的 R 裡跑
+
+`run_fresh()` 用 callr 開一個新的 R，只載入 kits，跑上面那一段：
+
+```{r}
+run_fresh <- function(label) {
+  code <- knitr::knit_code$get(label)
+  run <- \(code) utils::capture.output(source(textConnection(code), print.eval = TRUE))
+  cat(callr::r(run, list(code)), sep = "\n")
+}
+run_fresh("pipe-wle")
+```
+
+最後一行和這份教學算的分數，到第 15 位都相同：
+
+```{r}
+print(s$theta[1:3], digits = 15)
+```
+
+三條路是同一段程式：`kits_subj()` 和 `kits_subj_table()` 的 $\theta$、SE 都交給 `algo_jme()`。
+`kits_` 一層另外管輸入、量尺的標籤、個人適配、孩子的資料和診斷。
+
+
+## 11 下一步
+
+* 兩個校準接到同一條量尺，再換算分數：[03_linking](03_linking.html)。
+* 同齡的常模：[04_norms](04_norms.html)。
+* 題目適配、DIF 和其他檢查：[05_checks](05_checks.html)。
+* 模型在 RTMB 裡怎麼寫：[kits 的模型](../tutorial_models/kits_models.html) 的第 4 節。
+
+```{r}
+round(difftime(Sys.time(), t_start, units = "secs"))
+```
+
+
+## 參考文獻
+
+Firth, D. (1993). Bias reduction of maximum likelihood estimates. *Biometrika, 80*(1), 27–38.
+https://doi.org/10.1093/biomet/80.1.27
+
+Jeffreys, H. (1946). An invariant form for the prior probability in estimation problems.
+*Proceedings of the Royal Society of London, Series A, 186*(1007), 453–461.
+https://doi.org/10.1098/rspa.1946.0056
+
+Kristensen, K. (2026). *RTMB: R bindings for TMB* (R package version 2.0).
+https://doi.org/10.32614/CRAN.package.RTMB
+
+Linacre, J. M. (2002). What do infit and outfit, mean-square and standardized mean? *Rasch
+Measurement Transactions, 16*(2), 878.
+
+Magis, D. (2015). A note on weighted likelihood and Jeffreys modal estimation of proficiency levels
+in polytomous item response models. *Psychometrika, 80*(1), 200–204.
+https://doi.org/10.1007/s11336-013-9378-5
+
+Masters, G. N. (1982). A Rasch model for partial credit scoring. *Psychometrika, 47*(2), 149–174.
+https://doi.org/10.1007/BF02296272
+
+Warm, T. A. (1989). Weighted likelihood estimation of ability in item response theory.
+*Psychometrika, 54*(3), 427–450. https://doi.org/10.1007/BF02294627
+
+Wright, B. D., & Masters, G. N. (1982). *Rating scale analysis*. MESA Press.

@@ -1,0 +1,831 @@
+---
+title: "kits 入門：從作答到常模"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    from: markdown+east_asian_line_breaks
+    embed-resources: true
+    grid:
+      body-width: 1100px
+---
+
+```{=html}
+<style>.optional { border: 1px solid #ccc; border-radius: 6px; padding: 0.2em 1em 0.6em; background: #f7f7f7; margin: 1.5em 0; }</style>
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", out.width = "100%")
+options(width = 100)
+```
+
+這份教學寫給從沒用過試題反應理論（IRT）的人。
+它先拿一個世代的一個領域，從原始作答一路做到常模。
+接著把兩個世代、兩個領域放上同一把量尺。
+
+每一節先寫出要回答的問題。
+接著是程式碼。
+最後是一小段說明，告訴你怎麼看結果。
+
+這裡沒有公式。
+公式和每一步背後的程式碼，放在 `tutorial_algorithms/`。
+
+**資料是模擬資料。**
+這份教學裡沒有任何一列是真實的孩子。
+示範資料是從真實 KIT 資料的摘要抽出來的，所以看起來像 KIT。
+但你在這裡看到的每個數字都是假的。
+請不要把這些數字當作 KIT 的結果引用。
+
+
+## 0 開始之前
+
+**問題：資料長什麼樣子？**
+
+kits 只需安裝一次。
+之後每次開始工作，都和 dplyr、purrr 一起載入。
+kits 不在 CRAN 上；要從原始碼檔安裝。
+
+```{r install, eval = FALSE}
+install.packages("kits_0.23.0.tar.gz", repos = NULL, type = "source")
+```
+
+```{r load, message = FALSE}
+library(kits)
+library(dplyr)
+library(purrr)
+```
+
+kits 附了兩份示範資料：`kitm03` 和 `kitm36`。
+它們是 KIT 的兩個世代。
+M03 世代第一次施測在 3 個月；M36 世代在 36 個月。
+每個世代有 `r n_distinct(kitm03$responses$subj_id)` 個模擬的孩子。
+每個世代有兩個領域：語言（`"lan"`）和動作（`"motor"`）。
+
+每份資料是兩張表組成的 list：
+
+* `responses`：作答。
+* `anchors`：一份對照表，把部分 KIT 題目對到一個國際量尺的題目（第 10 節會用到）。
+
+在 `responses` 裡，一列是一個孩子在一次施測中作答一題。
+
+```{r look}
+kitm03$responses |>
+  head(3)
+```
+
+各欄位：
+
+* `visit_id`：一次施測，也就是一個孩子在一個波次，例如 `M03_c55df9b_M12`。
+  kits 把這叫做 *person-wave*，也就是一個人次。
+* `subj_id`：孩子，例如 `c55df9b`（7 個隨機的十六進位字元，像 git 的短 hash）。每次施測都一樣。
+  這個名稱和 `item_id` 成對：`subj_id` 說明誰作答，`item_id` 說明答哪一題。
+* `cohort`：`M03` 或 `M36`。
+* `sex`：`boy` 或 `girl`。
+* `wave_m`：施測預定的月齡（也就是*波次*）。
+* `age_m`：施測時實際的月齡。它接近 `wave_m`，但不相等。
+* `item_id`：題目。
+* `item_score`：這一題的分數，從 0 到 3。
+* `domain`：`lan` 或 `motor`。
+
+接著數一數每個世代、每個波次各有多少孩子。
+
+```{r count-waves}
+visits <- rbind(kitm03$responses, kitm36$responses) |>
+  distinct(cohort, wave_m, visit_id)
+visits |>
+  count(cohort, wave_m)
+```
+
+怎麼看：
+M03 的波次從 `r min(kitm03$responses$wave_m)` 到 `r max(kitm03$responses$wave_m)` 個月。
+M36 的波次從 `r min(kitm36$responses$wave_m)` 到 `r max(kitm36$responses$wave_m)` 個月。
+不是每個孩子每一波都有來，所以人數不同。
+
+**M03 的 60 和 72 個月兩個波次沒有實際觀察。**
+真實的 M03 世代只到 48 個月。
+示範資料裡，M03 在 60 和 72 個月的資料，是用 M36 同月齡的孩子模擬出來的。
+這兩個波次只是讓你看看追蹤更久會是什麼樣子。
+它們不是資料。
+
+
+## 1 一個領域、一個世代：M03 的語言
+
+**問題：哪些孩子作答了哪些題目？**
+
+kits 一次處理一個領域。
+先留下 M03 的語言作答。
+`kits_resp()` 把長表轉成一個人次一列、一個題目一欄。
+它也把每個孩子的資訊（`subj_id`、`sex`、`wave_m`、`age_m`）留在作答旁邊。
+之後每一步都從這裡取這些資訊，所以你不必自己對齊。
+
+```{r resp}
+resp <- kitm03$responses |>
+  filter(domain == "lan") |>
+  kits_resp()
+resp
+```
+
+怎麼看：
+共有 `r nrow(resp)` 個人次。
+第二行依波次列出人次數。
+`Checks: OK` 表示 kits 在這張表裡沒有發現問題。
+
+接下來會一直看到三個詞：
+
+* **題目**（item）是一項作業，例如「會把兩個詞連在一起說」。
+* **分數**（score）是孩子在這一題得到的分數。KIT 題目計分為 0、1、2 或 3。分數越高越好。
+* **作答組合**（item pattern）說明一個孩子實際作答了哪幾題。同一波次大多數孩子作答同一組題目；kits 把這一組叫做該波次的**標準題本**。少答一題的孩子，作答組合就稍有不同。
+
+`summary()` 列出每個波次的每一種作答組合。
+
+```{r resp-forms}
+summary(resp)
+```
+
+怎麼看：
+每個波次的第 1 個作答組合（form 1）就是標準題本。
+`n` 是作答這個組合的孩子人數，`pct` 是他們占該波次的比例。
+幾乎每個孩子都作答標準題本。
+其他作答組合是標準題本少一題，例如 `without lana05`。
+`n_items` 是這個作答組合的題數。
+
+`plot()` 畫出施測設計：每個波次作答了哪些題目。
+
+```{r resp-plot, fig.height = 5}
+plot(resp)
+```
+
+怎麼看：
+月齡小的波次作答簡單的題目；月齡大的波次作答較難的題目。
+相鄰的波次有一些共同題目。
+就是這些共同題目，讓 kits 能把所有波次放上同一把量尺。
+
+
+## 2 最快的做法：`kits()`
+
+**問題：能不能一步就得到題目門檻和孩子的分數？**
+
+有時候你只需要一個世代的量尺，不需要連結。
+這時 `kits()` 一次呼叫就完成校準和計分。
+
+```{r kits-fit}
+fit <- kits(resp)
+fit
+```
+
+怎麼看：
+上半部是題目表，和第 3 節一樣。
+`Abilities` 那一行摘要 `r nrow(fit$subj)` 個人次的位置（θ）。
+第 5 節會說明 θ。
+`Checks:` 那一行合併了題目和分數的檢查。
+這裡有 `r sum(fit$diagnostics$status == "warn")` 個 warning 和 `r sum(fit$diagnostics$status == "note")` 個 note。
+第 4 節說明題目適配的 note。
+第 5 節說明這些 warning 和其他的 note。
+
+分數在 `fit$subj` 裡。
+
+```{r kits-subj}
+fit$subj |>
+  select(visit_id, wave_m, theta, se) |>
+  head(3)
+```
+
+`plot()` 畫出 Wright 圖：左邊是孩子，右邊是題目門檻。
+
+```{r kits-plot, fig.height = 5}
+plot(fit)
+```
+
+`fit` 裝著兩個部分：`fit$item` 和 `fit$subj`。
+它們和 `kits_item()`、`kits_subj()` 的結果相同。
+
+```{r kits-parts, message = FALSE}
+item_check <- kits_item(resp)
+identical(coef(fit$item), coef(item_check))
+identical(fit$subj$theta, kits_subj(resp, item_check)$theta)
+```
+
+兩個都是 `TRUE`。
+本教學接下來一步一步做同樣的事。
+連結、常模和 D 分數都需要這兩個部分，所以那些地方會自己呼叫 `kits_item()` 和 `kits_subj()`。
+只想要一個世代的分數時，就用 `kits()`。
+
+
+## 3 校準：每一題有多難？
+
+**問題：每一題落在量尺的哪裡？**
+
+*校準*是指用所有孩子的作答，一次估計每一題有多難。
+kits 用部分給分模式（PCM）。
+這是處理 0、1、2、3 計分題目常用的 IRT 模式。
+你只需要提供作答。
+
+```{r item}
+item <- resp |>
+  kits_item()
+item
+```
+
+*量尺*就是那把尺。
+它的單位是 **logit**。
+你不需要知道 logit 的定義，記得兩件事就夠了：
+
+* 越大表示越難（對題目而言），或能力越高（對孩子而言）。
+* 零點是任意定的。每次校準都有自己的零點。
+
+所以量尺的名稱很重要：它說明這些數字在哪一把尺上。
+我們沒有給名稱，所以 kits 用領域和世代組成一個：`"`r attr(coef(item), "scale")`"`。
+上面的訊息就是在說這件事。
+要自己取名，可以寫 `kits_item(resp, scale = "lan M03")`。
+kits 會把這個名稱帶到之後的每個結果。
+
+接著看題目表。
+
+```{r item-coef}
+coef(item) |>
+  select(item_id, item_score, thr, thr_se) |>
+  head(6)
+```
+
+怎麼看：
+
+* 一列是一個題目的一個步驟。計分 0 到 3 的題目有三個步驟：從 0 到 1、從 1 到 2、從 2 到 3。
+* `thr`（門檻）是量尺上的一個點。孩子在這一點時，有 50% 的機會得到至少這個分數。
+* 第一個步驟（`item_score` 為 1）是*里程碑步驟*。kits 預設把得分至少 1 分算作通過這一題。
+* `thr_se` 是門檻的不確定程度。越小越精確。
+
+看一題的圖會比較好懂。
+下面是一個簡單題、一個中等題和一個難題。
+
+```{r item-plot, fig.height = 4}
+plot(item, items = c("lana01", "lanc05", "lanb08"))
+```
+
+怎麼看：
+每條曲線是得到某個分數的機率。
+在量尺上越往右，得低分的機會越小，得高分的機會越大。
+難題的曲線位置比較偏右。
+
+輸出的最後一行是 `Checks:`。
+kits 會自己檢查每個結果：估計有沒有收斂、有沒有沒人通過的題目等等。
+如果印出 `Checks: OK`，就表示所有檢查都通過。
+`note` 只是提供資訊；`warn` 需要看一下。
+這裡印出一個 note；`summary()` 會告訴你是哪一項檢查。
+
+```{r item-checks}
+summary(item)
+```
+
+怎麼看：
+第一列表示估計已經收斂。
+`item fit` 那一列就是這個 note：`r nrow(item$itemfit)` 題中有 `r summary(item)$diagnostics |> filter(check == "item fit") |> pull(value)` 題落在常用範圍之外。
+第 4 節會看題目適配。
+其他各列都是 `ok`。
+
+
+::: {.optional}
+### 為什麼 CML 不用假設能力分布（選讀）
+
+這一段可以跳過。
+它只是稍微說明 `kits_item()` 怎麼估計題目。
+
+kits 用*條件最大概似法*（CML）。
+CML 看每一個原始分，以及得到這個原始分的所有方式。
+`kits_esf()` 用幾個題目示範這件事；這裡用兩題。
+
+```{r esf}
+esf <- item |>
+  kits_esf(items = c("lana01", "lana02"))
+esf
+```
+
+表裡列出這兩題可能得到的每一個原始分 `r`。
+`gamma`（$\gamma_r$）把得到這個原始分的所有方式加總起來。
+輸出點出重點：θ 被消掉了。
+
+接著看中間的那個原始分。
+
+```{r esf-prob}
+esf$prob |>
+  filter(r == 3)
+```
+
+怎麼看：
+`lana01` 得到 `x` 分，`lana02` 得到其餘的分數。
+所以這幾列就是得到這個原始分的所有方式，以及各自的機率。
+這些機率只和題目參數有關。
+裡面沒有 θ：原始分相同的孩子，機會都一樣。
+所以 `kits_item()` 不必假設能力的分布，不論是常態分布還是其他分布。
+因此每個波次作答不同的題目時，它也適用。
+
+`plot()` 畫出每一題在每個原始分的期望分數。
+這裡畫的是 12 個月的標準題本。
+
+```{r esf-plot, fig.height = 4}
+form12 <- summary(resp)$forms |>
+  filter(wave_m == 12, form == 1)
+items12 <- strsplit(form12$items, ", ")[[1]]
+plot(kits_esf(item, items = items12))
+```
+
+第 4 節的條件題目適配，就是建立在這些期望分數上。
+公式在 `tutorial_algorithms/`：ESF 在 `01_calibration`，題目適配在 `05_checks`。
+:::
+
+
+## 4 題目適配嗎？
+
+**問題：每一題的作答符合模式嗎？**
+
+PCM 預期孩子先通過簡單題，再通過難題。
+*題目適配*逐題檢查作答有多符合這個預期。
+`kits_item()` 把題目適配存在 `item$itemfit`，一題一列。
+依 outfit 由大到小排序，列出前幾題。
+
+```{r itemfit}
+item$itemfit |>
+  arrange(desc(outfit)) |>
+  head(5)
+```
+
+圖上畫出每一題，可接受的範圍塗上灰色。
+
+```{r itemfit-plot, fig.height = 4}
+plot(item, type = "fit")
+```
+
+怎麼看：
+
+* 這是*條件*適配（`attr(item$itemfit, "type")`）：每個作答都和「已知孩子原始分時」的期望比較，就像上面選讀的那一段。它不需要 θ。
+* `infit` 和 `outfit` 是均方（mean square）。接近 1，表示作答的雜訊和模式預期的一樣。大於 1，表示有出乎意料的作答；小於 1，表示作答比預期更整齊。
+* 0.6 到 1.4 這個範圍是經驗法則，不是統計檢定。
+* `flag` 做出總結：高於範圍是 `underfit`，低於範圍是 `overfit`，在範圍內是 `ok`。這裡 `underfit` 有 `r sum(item$itemfit$flag == "underfit")` 題，`overfit` 有 `r sum(item$itemfit$flag == "overfit")` 題，`ok` 有 `r sum(item$itemfit$flag == "ok")` 題。
+* 第 3 節輸出中的 `Item fit:` 那一行，列出落在這個範圍外的題數和題號。
+* `pvalue` 是平均分占滿分的比例；`rir` 是這一題和其他題總分的相關。
+* 孩子也有適配：分數表有 `infit`、`outfit` 和 `flag` 三欄（見第 5 節）。
+* `kits_itemfit(resp, item)` 得到同一張表。換成別的資料，例如新的波次，就能檢查同一批題目在那份資料上的適配。
+
+
+## 5 計分：每個孩子在量尺的哪裡？
+
+**問題：每個孩子在每次施測時的能力有多高？**
+
+題目放上量尺之後，每個孩子也能放上同一把量尺。
+這就是*計分*。
+
+```{r subj}
+scores <- resp |>
+  kits_subj(item)
+scores
+```
+
+怎麼看：
+
+* 一列是一個人次。
+* **theta** 是孩子的能力值（θ），也就是孩子在量尺上的位置，單位是 logit。孩子的 θ 若和某個門檻相同，就有 50% 的機會得到至少那個分數。
+* **se** 是標準誤（SE），說明 θ 有多精確。SE 越小，位置越精確。大致來說，真正的位置落在 θ 上下 2 個 SE 之內。
+* 作答組合相同、總分也相同的孩子，會得到相同的 θ。
+* `flag` 標出每題都得 0 分（`zero`）或拿到滿分（`perfect`）的孩子。他們的 θ 比較不確定。`misfit` 標出作答不符合一般「簡單題會、難題不會」型態的孩子。他們的 `infit` 或 `outfit` 大於 2（Linacre 的規則：這樣的作答會干擾測量）。例如中等的題都沒過，最難的那題卻得分。
+
+這個方法叫 WLE；現在不需要了解它。
+
+最後一行說這些分數有警告。
+`summary()` 列出所有檢查；只留下不是 `ok` 的。
+
+```{r subj-checks}
+summary(scores)$diagnostics |>
+  filter(status != "ok") |>
+  select(status, check, value)
+```
+
+怎麼看：
+一個波次的*信度*說明它的分數把孩子區分得多好（1 最好）。
+3 和 6 個月的信度低於 0。
+這兩個波次的題目對很多孩子來說太難：在 3 個月，`r sum(scores$wave_m == 3)` 個孩子中有 `r sum(scores$wave_m == 3 & scores$flag == "zero")` 個每題都得 0 分。
+`misfit` 的 note 說有 `r round(100 * mean(scores$flag == "misfit"))`% 的人次被標為 `misfit`。
+
+接著看孩子怎麼成長。
+算出每個波次的平均 θ 和 SE。
+
+```{r subj-waves}
+scores |>
+  summarise(
+    n = n(),
+    theta = round(mean(theta), 2),
+    se = round(mean(se), 2),
+    .by = wave_m
+  )
+```
+
+怎麼看：
+平均 θ 隨月齡上升：頭兩年上升得快，之後變慢。
+3 個月的 SE 最大，因為很多孩子每題都得 0 分。
+60 和 72 個月的 SE 又變大，因為更多孩子拿到滿分。
+
+孩子和題目現在在同一把量尺上。
+*Wright 圖*同時呈現兩者：一邊是孩子，另一邊是題目門檻。
+
+```{r wright, fig.height = 5}
+plot(item, type = "wright", scores = scores)
+```
+
+怎麼看：
+旁邊有很多孩子的題目，和這些孩子的程度相配。
+遠高於或遠低於所有孩子的題目，對這些孩子提供的訊息很少。
+
+
+## 6 原始分對照表
+
+**問題：在一次施測中，每個原始分對應哪個 θ？**
+
+施測時，施測者把各題分數加起來。
+這個總和就是*原始分*。
+原始分對照表列出每個波次標準題本上，每個原始分對應的 θ 和 SE。
+
+```{r subj-table}
+raw_table <- scores |>
+  kits_subj_table()
+raw_table |>
+  filter(wave_m == 12) |>
+  select(wave_m, raw, theta, se, n)
+```
+
+怎麼看：
+
+* 一列是一個波次標準題本上的一個原始分。
+* `n` 是資料中得到這個原始分的孩子人數。
+* 同一個原始分在兩個波次會對應不同的 θ，因為題目不同。
+* 少答一題的孩子不在這張表裡。他們的 θ 來自 `kits_subj()`。
+
+不給資料時，`kits_subj_table(item)` 會列出每一種作答組合的每個原始分。
+可以用它印一張表給施測者。
+
+
+## 7 常模：孩子在同月齡孩子中排在哪裡？
+
+**問題：這個孩子比同月齡的孩子超前，還是落後？**
+
+**常模**描述每個月齡孩子的分數分布。
+它的**百分位**是一些切點。
+P50 在中間：同月齡孩子有一半分數低於它。
+P3 偏低：只有 3% 的孩子分數低於它。
+P97 偏高：97% 的孩子分數低於它。
+
+首先，檢查哪些波次可以納入常模。
+如果一個波次有很多孩子拿到最低分，就看不出誰落後。
+`kits_norm_screen()` 會排除拿到最低分的孩子達 20% 以上的波次。
+
+```{r norm-screen}
+screen <- scores |>
+  kits_norm_screen()
+screen
+```
+
+怎麼看：
+在 3 個月，有 `r screen$waves$floor_pct[screen$waves$wave_m == 3]`% 的孩子拿到最低分。
+所以 3 個月這一波被排除（`normed` 為 `FALSE`）。
+
+留下通過篩選的人次。
+
+```{r norm-keep}
+normed <- scores |>
+  filter(screen$normed)
+```
+
+kits 對每個百分位，從 P3 到 P97，配適一條隨月齡變化的平滑曲線。
+這裡男孩一份常模、女孩一份常模。
+月齡範圍由資料決定，並會印出來。
+
+```{r norms}
+norms <- normed |>
+  kits_norms(by = "sex")
+print(norms, n = 3)
+```
+
+怎麼看：
+訊息說這些常模的單位是 logit，在量尺 `"lan M03"` 上，不是 D（見第 10 節）。
+拿 logit 常模來學習沒有問題。
+輸出的第二行列出配適常模用的月齡，並說明每個性別各一份常模。
+一列是一個性別在一個月齡，每半個月一列。
+`mu`、`sigma`、`epsilon` 和 `delta` 描述這個月齡分數分布的形狀。
+你可以跳過它們；實際要用的是百分位。
+
+看幾個月齡。
+
+```{r norms-ages}
+norms |>
+  filter(age_m %in% c(6, 12, 24, 36, 48)) |>
+  select(sex, age_m, P3, P50, P97)
+```
+
+表頭仍然列出配適常模用的月齡。
+`showing 10 rows` 表示只印出你留下的列。
+
+```{r norms-plot, fig.height = 5}
+plot(norms, scores = normed)
+```
+
+怎麼看：
+曲線早期上升得快，之後趨於平緩，和第 5 節的各波次平均一樣。
+孩子應該散布在曲線周圍：大約 3% 在 P3 以下，大約 3% 在 P97 以上。
+
+接著拿每個孩子和常模比較。
+**z 分數**說明一個孩子比同月齡、同性別的孩子高（+）或低（−）幾個標準差。
+**百分等級**（`pct`）說明這些孩子中有多少比例分數比他低。
+z = 0 在中間（50%）；z = −2 偏低（約 2%）。
+
+```{r norm-z}
+scores_z <- scores |>
+  kits_norm_z(norms)
+scores_z |>
+  filter(!is.na(z)) |>
+  summarise(mean = round(mean(z), 2), sd = round(sd(z), 2), .by = wave_m)
+```
+
+怎麼看：
+每個波次的平均 z 應該接近 0，標準差應該接近 1。
+如果是這樣，常模就符合建立它的那些孩子。
+月齡在常模範圍外的孩子會得到 `NA`。
+這裡就是 3 個月這一波，篩選時已經排除。
+
+接著跟著一個孩子看各次施測。
+
+```{r norm-z-child}
+scores_z |>
+  filter(subj_id == "c55df9b") |>
+  select(wave_m, age_m, theta, flag, z, pct)
+```
+
+怎麼看：
+θ 隨年齡上升，因為孩子在成長。
+θ 不是每次都上升：每個 θ 都有 SE，所以小幅下降可能只是誤差。
+z 在大多數施測都接近 0：這個孩子在同月齡孩子中維持原來的位置。
+在 60 個月，這個孩子拿到滿分（`perfect`）。
+他的 θ 很高但不確定，所以 z 跳高了一次。
+如果 z 持續下降，就表示這個孩子成長得比同儕慢。
+
+請記得：這些常模來自模擬的孩子，而且 60 和 72 個月沒有實際觀察。
+它們是在示範方法，不是 KIT 常模。
+
+
+## 8 孩子在幾個月大時通過各題？
+
+**問題：一半的孩子在幾個月大時通過各題？**
+
+`kits_item_table()` 對每一題配適通過機率怎麼隨月齡上升。
+它回報一半孩子通過時的月齡（`age50`）。
+它也把每一題放到常模上，所以要給一個所有孩子共用一條曲線的常模。
+`D` 是這一題第一步（通過）的門檻，這裡還是 `"lan M03"` 上的 logit。
+
+```{r age-pass}
+norm_all <- normed |>
+  kits_norms()
+item_tab <- kits_item_table(item, norm_all, data = resp)
+item_tab |>
+  select(item_id, D, age50) |>
+  arrange(D)
+```
+
+怎麼看：
+`age50` 的單位是月。
+在觀察到的月齡範圍內，通過率如果一直沒有跨過一半，`age50` 就是 `NA`。
+這裡發生在 36 個月才開始施測的題目：大多數孩子在第一次施測時就已經通過。
+
+表依門檻排，所以可以比較兩種排列題目的方式：依門檻排，和依月齡排。
+越難的題目（`D` 越大），越晚通過（`age50` 越大）。
+兩種排序的相關是 `r round(cor(item_tab$D, item_tab$age50, use = "complete.obs"), 2)`。
+不合這個趨勢的題目值得再仔細看。
+
+`plot()` 把每一題放到常模的成長曲線上，位置是它的 `D` 和 `age50`。
+
+```{r age-pass-plot, fig.height = 5}
+plot(item_tab)
+```
+
+
+## 9 兩個世代放上同一把量尺
+
+**問題：M36 的孩子能和 M03 的孩子比較嗎？**
+
+到目前為止，所有結果都在量尺 `"lan M03"` 上。
+如果單獨校準 M36，會得到另一把量尺 `"lan M36"`，有自己的零點。
+一把量尺上的 θ = 1，不等於另一把量尺上的 θ = 1。
+**連結**就是找出一條規則，把數字從一把量尺轉到另一把。
+
+首先，對 M36 做第 1、3、5 節的步驟。
+
+```{r m36}
+resp36 <- kitm36$responses |>
+  filter(domain == "lan") |>
+  kits_resp()
+item36 <- kits_item(resp36)
+scores36 <- kits_subj(resp36, item36)
+```
+
+有些題目兩個世代都作答過。
+這些*共同題目*在每把量尺上各有一個門檻。
+kits 用一條直線穿過這些成對的門檻：
+
+M03 上的 θ = intercept + slope × M36 上的 θ
+
+```{r link}
+co <- kits_linking(item36, item)
+co
+```
+
+怎麼看：
+
+* `scales: lan M36 -> lan M03` 說明方向。請確認方向：反過來也是一個有效的連結。
+* `intercept`（截距）和 `slope`（斜率）決定這條直線：這裡 intercept = `r round(co$intercept, 2)`，
+  slope = `r round(co$slope, 2)`。
+* 許多教科書（Kolen & Brennan）把這條直線寫成 A × θ + B，其中 A 是斜率。
+  kits 0.22 和更早的版本把截距叫做 `a`，把斜率叫做 `b`。
+* `points` 是用到的共同題目步驟數（這裡是 `r co$n`）。
+* `dropped` 列出離直線太遠而被排除的步驟（這裡有 `r length(co$dropped)` 個）。
+
+```{r link-plot, fig.height = 4.5}
+plot(co)
+```
+
+接著把 M36 的分數轉到 M03 的量尺上。
+
+```{r convert}
+scores36_03 <- scores36 |>
+  kits_convert(co)
+print(scores36_03, n = 3)
+```
+
+欄位名稱仍然是 `theta`。
+只有量尺變了；輸出和 `attr(, "scale")` 會告訴你是哪一把。
+
+兩個世代在 36 到 72 個月重疊。
+如果連結有效，同月齡的孩子在兩個世代的平均應該差不多。
+用 `rbind()` 把兩張表疊起來。
+
+```{r overlap}
+both <- rbind(scores, scores36_03)
+both |>
+  filter(wave_m %in% c(36, 48, 60, 72)) |>
+  summarise(theta = round(mean(theta), 2), .by = c(wave_m, cohort)) |>
+  arrange(wave_m)
+```
+
+怎麼看：
+在 36 和 48 個月，兩個平均很接近。
+兩個世代在這兩個月齡都有實際觀察，所以 36 和 48 個月才是公平的檢驗。
+在 60 和 72 個月，M03 是用 M36 模擬的，所以這幾列不能檢驗連結。
+
+kits 不讓你把不同量尺上的表疊在一起。
+如果忘了 `kits_convert()`，`rbind()` 會報錯並停止。
+這是刻意設計的。
+
+```{r rbind-error, error = TRUE}
+rbind(scores, scores36)
+```
+
+`kits_vertical()` 摘要每個世代在每個波次的結果。
+它的圖把兩個世代畫在同一把量尺上。
+
+```{r vertical, fig.height = 4.5}
+plot(kits_vertical(both), type = "median")
+```
+
+怎麼看：
+每個點是一個世代在一個波次的 θ 中位數；線段從 P25 到 P75。
+在兩個世代重疊的地方，兩組點應該幾乎重合。
+線一直延伸到 96 個月；重疊之後只剩 M36。
+
+
+## 10 兩個領域，以及 D 分數
+
+**問題：怎麼把語言和動作報告在同一個國際量尺上？**
+
+到目前為止，你一步一步做了一個領域。
+現在把語言和動作一起做。
+`purrr::map()` 對每個領域跑相同的步驟；`list_rbind()` 把結果疊起來。
+
+```{r domains-items}
+resps <- c("lan", "motor") |>
+  set_names() |>
+  map(\(d) kits_resp(filter(kitm03$responses, domain == d)))
+items <- resps |>
+  map(kits_item)
+```
+
+**D 分數**是世界衛生組織（WHO）GSED（Global Scales for Early Development）的發展分數。
+它的單位是 D。
+把 KIT 放上 D 量尺，KIT 就能和其他國家比較。
+
+有些 KIT 題目和 GSED 題目相同。
+這些就是**錨題**。
+每一題都有已知的 GSED 難度 `tau`，單位是 D。
+對照表已經在資料裡：`kitm03$anchors`。
+
+```{r anchors}
+used <- kitm03$responses |>
+  distinct(item_id, domain)
+n_anchors <- kitm03$anchors |>
+  semi_join(used, by = c("item_id", "domain")) |>
+  count(domain)
+n_anchors
+```
+
+怎麼看：
+在 M03，動作有 `r n_anchors$n[n_anchors$domain == "motor"]` 個錨題，語言只有 `r n_anchors$n[n_anchors$domain == "lan"]` 個。
+連結至少需要 3 個錨題。
+所以語言無法單獨連結到 D：
+
+```{r d-link-lan, error = TRUE}
+kits_linking(items$lan, kitm03$anchors)
+```
+
+這是把兩個領域一起連結、共用一條直線的原因之一。
+把兩個校準結果組成具名的 list，交給 `kits_linking()`。
+
+```{r d-link}
+d_link <- kits_linking(items, kitm03$anchors)
+d_link
+```
+
+怎麼看：
+
+* D = intercept + slope × θ，其中 θ 在各領域的 M03 量尺上。
+  這裡 intercept = `r round(d_link$intercept, 1)`，slope = `r round(d_link$slope, 1)`。
+* `kept points by domain` 顯示大部分錨題來自動作。
+* 領域檢查讓每個領域各有自己的截距，作為檢查之用。
+* 各領域的截距（`r round(d_link$domains$intercept, 1)`）接近共用的 `intercept`，所以兩個領域共用一條直線是合理的。
+
+接著替兩個領域計分，並轉成 D。
+
+```{r d-scores}
+d_scores <- map2(resps, items, kits_subj) |>
+  map(\(s) kits_convert(s, d_link)) |>
+  list_rbind(names_to = "domain")
+print(d_scores, n = 3)
+```
+
+兩個領域的量尺現在都是 `D`。
+把每個領域在每個波次的平均 D 放進一張表。
+
+```{r d-table}
+d_scores |>
+  summarise(D = round(mean(theta), 1), .by = c(wave_m, domain)) |>
+  tidyr::pivot_wider(names_from = domain, values_from = D)
+```
+
+怎麼看：
+兩個領域現在都是 D，所以它們的平均可以放在同一張表。
+兩個領域的 D 都隨月齡上升。
+
+M36 要經過兩次連結才到 D：先用 `co`（M36 到 M03），再用 `d_link`（M03 到 D）。
+把兩個連結依套用的順序交給 `kits_convert()`。
+
+```{r d-m36}
+scores36_d <- scores36 |>
+  kits_convert(co, d_link)
+scores36_d |>
+  summarise(D = round(mean(theta), 1), .by = wave_m) |>
+  arrange(wave_m)
+```
+
+怎麼看：
+在 36 和 48 個月，M36 的語言應該接近上表中 M03 的語言。
+72 個月之後，只有 M36 繼續。
+
+
+## 11 下一步
+
+* **真實 KIT 資料**：`tutorial_kit/`。步驟相同，但用真實的作答檔，並加上常模篩選和更多檢查。
+* **公式和程式碼**：`tutorial_algorithms/`，分成六份（校準、計分、連結、常模、檢查、量尺）。每一步都寫成公式、寫成程式碼，並用手算核對。`kits_algorithm(x)` 說明任何結果 `x` 是怎麼算出來的：步驟、公式、函數和文獻。
+* **其他套件**：`tutorial_compare/` 比較 kits 和 TAM。kitsPreview 用 dexter 或 immer 跑相同的步驟。
+* **kits 的其他功能**：`vignette("kits-flow", package = "kits")` 和 `vignette("kits-advanced", package = "kits")` 介紹題目適配、DIF、連結誤差、新波次，以及各項檢查（`kits_check()`、`kits_info()`）。
+
+
+## 本教學用到的詞
+
+| 詞 | 白話意思 |
+|---|---|
+| 題目（item） | 要孩子做的一項作業。 |
+| 分數（score） | 孩子在一題得到的分數：0、1、2…… |
+| 原始分（raw score） | 一次施測各題分數的總和。 |
+| 作答組合（item pattern） | 一個孩子在一次施測中作答了哪幾題。 |
+| 標準題本（standard form） | 一個波次大多數孩子作答的作答組合。 |
+| 人次（person-wave、visit） | 一個孩子在一個波次的施測（`visit_id`）。 |
+| 校準（calibration） | 用所有作答，一次估計每一題有多難。 |
+| 量尺（scale） | 放置題目和孩子的那條線。它有名稱，例如 `"lan M03"`。 |
+| logit | 校準後量尺的單位。它的零點是任意定的。 |
+| 門檻（`thr`） | 量尺上的一個點；孩子在這一點時，有 50% 的機會得到至少這個分數。 |
+| 題目適配（infit、outfit） | 一題的作答有多符合模式。接近 1 就好。 |
+| 能力值（θ） | 孩子在量尺上的位置。 |
+| 標準誤（SE） | θ 或門檻有多精確。越小越精確。 |
+| 信度 | 一個波次的分數把孩子區分得多好。1 最好。 |
+| 50% 通過月齡（`p50`） | 一半孩子通過某一題時的月齡。 |
+| 常模 | 每個月齡孩子的分數分布。 |
+| 百分位（P3 … P97） | 同月齡孩子有 3%、…、97% 低於它的分數。 |
+| z 分數 | 一個孩子比同月齡孩子高或低幾個標準差。 |
+| 百分等級（`pct`） | 同月齡孩子中分數比他低的比例。 |
+| 共同題目 | 兩個世代都作答過的題目。 |
+| 連結 | 找出一條直線，把數字從一把量尺轉到另一把。 |
+| 錨題 | 同時也是 GSED 題目的 KIT 題目，在 D 量尺上有已知難度。 |
+| D 分數 | GSED 的發展量尺。它的單位是 D。 |
