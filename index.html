@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kitsExample</title>
+<style>
+  :root { --ink: #1f2933; --muted: #5f6b76; --line: #d9dee3; --accent: #0072B2; --bg: #ffffff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink: #e6e9ec; --muted: #a3adb7; --line: #39424b; --accent: #56B4E9; --bg: #15191d; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.7 "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 48px 20px 64px; }
+  h1 { font-size: 2rem; margin: 0 0 4px; }
+  h2 { font-size: 1.15rem; margin: 40px 0 8px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  p { margin: 8px 0; }
+  .lead { color: var(--muted); }
+  a { color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td:first-child { white-space: nowrap; width: 9rem; }
+  code { font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: .92em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>kitsExample</h1>
+  <p class="lead"><a href="https://github.com/jiewenTsai/kits">kits</a> 和
+    <a href="https://github.com/jiewenTsai/kitsPreview">kitsPreview</a> 的教學、例子和模擬。
+    全部只用套件的示範資料（<code>kitm03</code>、<code>kitm36</code>）和模擬資料。</p>
+
+  <h2>入門</h2>
+  <table>
+    <tr><td><a href="tutorial_beginner/kits_beginner_zh.html">中文</a></td><td>kits 入門：從作答到常模</td></tr>
+    <tr><td><a href="tutorial_beginner/kits_beginner.html">English</a></td><td>kits for beginners: from answers to norms</td></tr>
+  </table>
+
+  <h2>演算法（七份，循序漸進）</h2>
+  <table>
+    <tr><td><a href="tutorial_algorithms/01_calibration.html">01 校準</a></td><td>從作答到門檻：PCM、CML、ESF</td></tr>
+    <tr><td><a href="tutorial_algorithms/02_scoring.html">02 計分</a></td><td>每個孩子的 WLE 和 SE</td></tr>
+    <tr><td><a href="tutorial_algorithms/03_linking.html">03 連結</a></td><td>世代連結、接到 D</td></tr>
+    <tr><td><a href="tutorial_algorithms/04_norms.html">04 常模</a></td><td>shash 常模</td></tr>
+    <tr><td><a href="tutorial_algorithms/05_checks.html">05 檢查題目</a></td><td>適配、gamma、DIF、偏移、每組的通過率</td></tr>
+    <tr><td><a href="tutorial_algorithms/06_scale.html">06 量尺</a></td><td>訊息、精準度、原始分對照、垂直量尺</td></tr>
+    <tr><td><a href="tutorial_algorithms/07_subscales.html">07 分量表</a></td><td>分量表分數、SE、成長模型和模擬</td></tr>
+  </table>
+
+  <h2>其他</h2>
+  <table>
+    <tr><td><a href="tutorial_models/kits_models.html">模型</a></td><td>寫一次，導數交給 RTMB</td></tr>
+    <tr><td><a href="tutorial_preview/kitsPreview_tutorial_zh.html">kitsPreview</a></td><td>dexter、immer、cNORM 原本怎麼做</td></tr>
+    <tr><td><a href="simulation_20261028/sim_report_zh.html">模擬</a></td><td>已知真值下比較四種估法</td></tr>
+  </table>
+
+  <p class="lead" style="margin-top:40px">原始碼：<a href="https://github.com/jiewenTsai/kitsExample">github.com/jiewenTsai/kitsExample</a> · 授權 GPL-3</p>
+</main>
+</body>
+</html>
